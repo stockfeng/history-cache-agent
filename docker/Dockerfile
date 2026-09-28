@@ -29,7 +29,7 @@ RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DHISTORY_CACHE_CURL=ON \
 
 FROM rockylinux:9
 
-RUN dnf install -y --setopt=install_weak_deps=False \
+RUN dnf install -y --allowerasing --setopt=install_weak_deps=False \
     libstdc++ \
     openssl-libs \
     libcurl \
