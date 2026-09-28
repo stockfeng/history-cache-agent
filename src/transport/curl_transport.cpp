@@ -113,8 +113,14 @@ HttpResult CurlHttpTransport::perform(const HttpRequest& request) {
         Callbacks callbacks(request);
         auto* curl = handle.get();
         option(curl, CURLOPT_URL, request.url.c_str());
+        // CURLOPT_PROTOCOLS_STR requires curl >= 7.85; Rocky 9 has 7.76.
+#if LIBCURL_VERSION_NUM >= 0x075500
         option(curl, CURLOPT_PROTOCOLS_STR, "https");
         option(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#else
+        option(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+        option(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+#endif
         option(curl, CURLOPT_FOLLOWLOCATION, 0L);
         option(curl, CURLOPT_MAXREDIRS, 0L);
         option(curl, CURLOPT_PROXY, "");
