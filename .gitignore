@@ -1,0 +1,10 @@
+/build*/
+/out/
+/artifacts/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.pem
+*.key

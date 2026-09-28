@@ -1,0 +1,46 @@
+{
+  "amz_date": "20260921T010203Z",
+  "cases": [
+    {
+      "authorization": "AWS4-HMAC-SHA256 Credential=SYNTHETICKEYID/20260921/auto/s3/aws4_request, SignedHeaders=host;if-match;range;x-amz-content-sha256;x-amz-date, Signature=f97b5cdefd5ec392a9c1587eb715f233be8b0c4c960436b65873e2c5fcbb21c3",
+      "body_hex": "",
+      "canonical_request_sha256": "cd1ead4fad3f0a506eb225e71ebc34ac3723b657f0440ccc612b767d04668c99",
+      "headers": {
+        "if-match": "\"opaque/Case-123\"",
+        "range": "bytes=10-99"
+      },
+      "host": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.r2.cloudflarestorage.com",
+      "method": "GET",
+      "path": "/history-cache-staging/r2-history-staging/offline-001/current.json",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "authorization": "AWS4-HMAC-SHA256 Credential=SYNTHETICKEYID/20260921/auto/s3/aws4_request, SignedHeaders=content-type;host;if-none-match;x-amz-content-sha256;x-amz-date, Signature=812a256ee2151b86717ab2641e1917cc468111be14246ae5dbb3ca9ccbca0358",
+      "body_hex": "73796e7468657469632d706f696e7465722d62797465730a",
+      "canonical_request_sha256": "e902890d991591f932527f6b31d22d591ff65e931781f517cfa1261bd77400b5",
+      "headers": {
+        "content-type": "application/octet-stream",
+        "if-none-match": "*"
+      },
+      "host": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.r2.cloudflarestorage.com",
+      "method": "PUT",
+      "path": "/history-cache-staging/r2-history-staging/offline-001/current.json",
+      "payload_sha256": "9ff8eaf71aa804ea81cfaa8520225d22d294007f2f99f652e8a19a2bfb174ff0"
+    },
+    {
+      "authorization": "AWS4-HMAC-SHA256 Credential=SYNTHETICKEYID/20260921/auto/s3/aws4_request, SignedHeaders=cache-control;host;if-match;x-amz-content-sha256;x-amz-date, Signature=1cf593ae0326637f997b41f5f39bc190763b92e2769546a8cf02a333916cc6f4",
+      "body_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "canonical_request_sha256": "114d670cdd70b260597559f97a3dccd4c0ba8c6180866688c820b6d7c327d03a",
+      "headers": {
+        "cache-control": "no-cache, no-store",
+        "if-match": "\"opaque/not-an-md5\""
+      },
+      "host": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.r2.cloudflarestorage.com",
+      "method": "PUT",
+      "path": "/history-cache-staging/r2-history-staging/offline-001/current.json",
+      "payload_sha256": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880"
+    }
+  ],
+  "schema_version": 1,
+  "scope": "synthetic-only-auto-s3"
+}

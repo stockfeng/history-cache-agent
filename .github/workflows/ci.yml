@@ -1,0 +1,36 @@
+name: offline-core
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        sanitizers: ["OFF", "ON"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ pkg-config libssl-dev libzstd-dev nlohmann-json3-dev
+      - name: Configure
+        run: timeout --kill-after=5s 30s cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DHISTORY_CACHE_CURL=OFF -DHISTORY_CACHE_SANITIZERS=${{ matrix.sanitizers }}
+      - name: Build
+        run: timeout --kill-after=5s 180s cmake --build build --parallel 2
+      - name: Test
+        run: |
+          timeout --kill-after=5s 300s ctest --test-dir build --output-on-failure --parallel 1 --no-tests=error --output-junit build/ctest.xml
+          timeout --kill-after=5s 10s python3 -B tests/check_ctest_matrix.py --junit build/ctest.xml
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          PYTHONDONTWRITEBYTECODE: "1"

@@ -1,0 +1,27 @@
+[Unit]
+Description=History Cache Agent (R2 cache reader for cloud_gateway_v2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/history-cache/bin/history-cache-agent \
+  --socket /run/history-cache/agent.sock \
+  --account ${R2_ACCOUNT_ID} \
+  --access-key-id ${R2_ACCESS_KEY_ID} \
+  --secret-access-key ${R2_SECRET_ACCESS_KEY}
+EnvironmentFile=/opt/history-cache/etc/r2-agent.env
+Restart=always
+RestartSec=5
+RuntimeDirectory=history-cache
+RuntimeDirectoryMode=0755
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/history-cache
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

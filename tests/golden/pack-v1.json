@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "description": "Fixed single-row synthetic pack; decoder golden, not cross-version compressed encoder identity.",
+  "manifest": {
+    "dataset_epoch": "fixture-epoch-1",
+    "entries": [
+      {
+        "coverage_complete": true,
+        "coverage_end_ms": 1704067260000,
+        "coverage_start_ms": 1704067200000,
+        "data_version": "96c883a59b8c7abc36c72ecf54a1edd52e7ac7eb7bfde689d43da8cde1a2b820",
+        "identity": {
+          "adjust": "none",
+          "dataset": "synthetic",
+          "market": "TEST",
+          "period_seconds": 60,
+          "symbol": "FIXTURE"
+        },
+        "object": {
+          "bytes": 301,
+          "index_sha256": "35710b27d23d7bb05b6106d2a0f11dc1bba893a55c73fa1b28e102b652fece8b",
+          "key": "data/v1/426ef5dfda69ea5180fbb9aebe9a8796f650c14d756b259051d6435834e56067.r2b",
+          "sha256": "426ef5dfda69ea5180fbb9aebe9a8796f650c14d756b259051d6435834e56067"
+        },
+        "rows": 1,
+        "series_id": "2f7c6a5825f44f403af4460e38a6fd00",
+        "source_version": 1
+      }
+    ],
+    "kind": "complete-interval-snapshot",
+    "schema_version": 1
+  },
+  "pack_hex": "52324831000100a0000100010000003c2f7c6a5825f44f403af4460e38a6fd0096c883a59b8c7abc36c72ecf54a1edd52e7ac7eb7bfde689d43da8cde1a2b82000000000000000010000018cc251f4000000018cc252de600000018cc251f4000000018cc251f4000000000000000001000000010000005000000000000000a000000000000000f0000000000000003d0000000000000000000000000000000000000000000000010000018cc251f4000000018cc251f400000000300000003d00000000000000f00000000000000000b32aebd50161be7cfc55eb2b64f194e962a15e7c9041f1616f079d2713ea460028b52ffd24308101000102003f0000000100000008000000000000018cc251f4000000c8420000ca420000c6420000c9420100000000000000ee6763c9"
+}

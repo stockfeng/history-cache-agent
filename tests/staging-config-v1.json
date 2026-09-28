@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "profile": "cpp-staging-2050-v1",
+  "environment": "staging",
+  "account_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "bucket": "history-cache-staging",
+  "jurisdiction": "default",
+  "key_prefix": "r2-history-staging/",
+  "credentials": {
+    "provider": "environment",
+    "access_key_id_env": "R2_STAGING_ACCESS_KEY_ID",
+    "secret_access_key_env": "R2_STAGING_SECRET_ACCESS_KEY"
+  },
+  "confirmations": {
+    "dedicated_bucket": false,
+    "private_bucket": false,
+    "bucket_scoped_credentials": false,
+    "fresh_credentials_ready": false,
+    "new_cpp_budget_approved": false,
+    "cleanup_owner_ready": false
+  },
+  "budget": {
+    "max_reserved_requests": 112,
+    "max_upload_body_bytes": 65536,
+    "max_download_reserved_bytes": 134217728,
+    "max_stored_body_bytes": 65536,
+    "max_run_seconds": 540,
+    "business_seconds_per_namespace": 120,
+    "cleanup_seconds_per_namespace": 60,
+    "request_timeout_seconds": 10,
+    "connect_timeout_seconds": 3,
+    "max_cost_usd": "0.10"
+  },
+  "cleanup": "verified_created_objects_only"
+}

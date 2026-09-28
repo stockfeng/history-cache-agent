@@ -1,0 +1,3 @@
+{
+  "authorization": "AWS4-HMAC-SHA256 Credential=SYNTHETICKEYID/20260921/auto/s3/aws4_request, SignedHeaders=host;if-match;x-amz-content-sha256;x-amz-date, Signature=56c17d4d5c92764f593f81831b05db3b891001dbdc1f765fed06c202e041673a"
+}

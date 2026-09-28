@@ -1,0 +1,62 @@
+{
+  "staging_plan": [
+    "cpp_plan_small_fixture_exact_sequence_and_reservations",
+    "cpp_config_strict_fields_confirmations_and_budgets",
+    "cpp_fixture_content_and_run_path_guards",
+    "approval_gate_precedes_credentials_transport_and_output",
+    "input_symlink_fifo_and_parent_traversal_rejected"
+  ],
+  "staging_execution": [
+    "three_scenarios_execute_and_cleanup_with_no_credential_logging",
+    "namespace_registry_prevents_replay_in_new_output_before_loading_keys",
+    "existing_objects_stop_without_put_or_delete",
+    "unknown_pack_write_is_not_owned_or_deleted_even_on_matching_readback",
+    "unexpected_manifest_412_cannot_be_adopted_by_immutable_helper",
+    "delete_ack_loss_preserves_pointer_dependencies_and_residue",
+    "cleanup_if_match_rejects_changed_object_without_delete",
+    "business_cancellation_keeps_separate_cleanup_budget",
+    "short_range_stops_publication_and_cleans_only_owned_pack",
+    "ignored_delete_precondition_stops_without_deleting_dependencies",
+    "baseline_unknown_pointer_only_reads_original_target_and_stops",
+    "read_only_resume_missing_target_never_writes_or_reads_manifest",
+    "read_only_resume_newer_target_never_writes_or_reads_manifest"
+  ],
+  "staging_ledger": [
+    "intent_fsync_failure_prevents_credentials_and_dispatch",
+    "request_and_dispatch_floor_fail_before_network",
+    "result_checkpoint_error_preserves_pending_dispatch_after_reopen",
+    "ledger_corruption_and_lost_dispatch_suffix_fail_closed",
+    "ledger_lock_and_permissions_fail_closed",
+    "result_suffix_loss_preserves_pending_without_refunding_usage",
+    "ledger_byte_corruption_symlink_and_hardlink_are_rejected",
+    "request_deadline_expiring_during_fsync_never_dispatches",
+    "finish_checkpoint_failure_never_reports_completed_run"
+  ],
+  "staging_delete": [
+    "delete_is_exact_conditional_single_request_and_conservative",
+    "delete_timeout_unverified_and_nonempty_ack_are_unknown",
+    "delete_sigv4_independent_vector_and_disabled_curl"
+  ],
+  "staging_retention": [
+    "retention_plan_excludes_all_deletes_and_bounds_inventory",
+    "retention_config_is_explicit_versioned_and_strict",
+    "retention_approval_owner_and_budget_changes_require_new_hashes",
+    "retention_three_scenarios_pass_with_nine_owned_objects_and_no_delete",
+    "retention_capabilities_are_observations_not_delete_verification",
+    "retention_unknown_pack_write_never_adopts_or_cleans",
+    "retention_unknown_pointer_matching_recovery_stops_without_adoption",
+    "retention_preexisting_key_reports_unowned_without_mutation",
+    "retention_manifest_conflict_invalidates_prior_absence",
+    "retention_short_range_stops_without_cleanup",
+    "retention_changed_identity_cannot_be_reported_as_owned_retention",
+    "retention_ignored_put_condition_fails_without_profile_fallback",
+    "retention_cancellation_keeps_owned_data_without_cleanup_budget",
+    "retention_read_only_resume_missing_retains_prior_scenarios",
+    "retention_read_only_resume_newer_retains_prior_scenarios",
+    "retention_registry_cannot_be_reused_by_other_profile",
+    "retention_pending_write_reopens_unknown_without_budget_refund",
+    "retention_review_deadline_is_persistent_not_automatic_expiry",
+    "retention_start_checkpoint_failure_precedes_credentials",
+    "retention_ledger_independently_rejects_delete_and_oversized_write"
+  ]
+}
