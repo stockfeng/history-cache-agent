@@ -6,9 +6,6 @@ name: Build and Push history-cache-agent Docker Image
 on:
   push:
     branches: [main, feature/*]
-    paths:
-      - "components/history-cache/**"
-      - ".github/workflows/build-docker.yml"
   workflow_dispatch:
 
 env:
