@@ -34,7 +34,11 @@ target_include_directories(history_cache_core PUBLIC include)
 target_include_directories(history_cache_core PRIVATE src/core)
 target_link_libraries(history_cache_core PUBLIC
     OpenSSL::Crypto PkgConfig::ZSTD nlohmann_json::nlohmann_json)
-target_compile_options(history_cache_core PRIVATE -Wall -Wextra -Wconversion -Wshadow -Werror)
+target_compile_options(history_cache_core PRIVATE -Wall -Wextra -Wconversion -Wshadow)
+# GCC 11 (Rocky 9) has false-positive optimizer warnings; enforce -Werror only on GCC 12+.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
+    target_compile_options(history_cache_core PRIVATE -Werror)
+endif()
 
 if(HISTORY_CACHE_CURL)
     # 7.76 covers Rocky 9 (7.76), matching the cloud_gateway_v2 base image.
