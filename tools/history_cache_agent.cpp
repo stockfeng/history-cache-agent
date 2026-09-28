@@ -231,11 +231,24 @@ private:
             }
         }
         auto store = get_store(namespace_name);
-        auto current = store->read_current();
-        if (!current) return nullptr;
-        const auto pointer = hc::parse_pointer(std::string(current->bytes.begin(), current->bytes.end()));
-        auto manifest_bytes = store->get(pointer.manifest_key, hc::kMaxMetadataBytes);
-        auto manifest = hc::parse_manifest(std::string(manifest_bytes.begin(), manifest_bytes.end()));
+        // Retry manifest fetch: R2 TLS can be transient from any network.
+        std::optional<hc::VersionedObject> current;
+        hc::Pointer pointer;
+        hc::Manifest manifest;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            try {
+                current = store->read_current();
+                if (!current) return nullptr;
+                pointer = hc::parse_pointer(std::string(current->bytes.begin(), current->bytes.end()));
+                auto manifest_bytes = store->get(pointer.manifest_key, hc::kMaxMetadataBytes);
+                manifest = hc::parse_manifest(std::string(manifest_bytes.begin(), manifest_bytes.end()));
+                break;
+            } catch (const hc::Error&) {
+                if (attempt == 2) return nullptr;  // exhausted retries
+                std::this_thread::sleep_for(std::chrono::milliseconds(
+                    500 * (attempt + 1)));  // 500ms, 1000ms backoff
+            }
+        }
         auto snapshot = std::make_shared<hc::Snapshot>(hc::Snapshot{pointer, std::move(manifest)});
         {
             std::lock_guard<std::mutex> guard(cache_mutex_);
