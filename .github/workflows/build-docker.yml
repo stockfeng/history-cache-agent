@@ -35,7 +35,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and test
-        working-directory: components/history-cache
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DHISTORY_CACHE_CURL=ON
           cmake --build build -j$(nproc)
