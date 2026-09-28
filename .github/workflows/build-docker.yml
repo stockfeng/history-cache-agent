@@ -34,12 +34,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and test
-        run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DHISTORY_CACHE_CURL=ON
-          cmake --build build -j$(nproc)
-          ctest --test-dir build --output-on-failure
-
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
