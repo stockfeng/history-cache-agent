@@ -4,6 +4,33 @@ C++17 core and UDS agent for the R2 historical-cache project. This is an
 independent Git repository inside the integration workspace. Building or testing
 the component does not deploy services or publish data.
 
+## Factor versions versus source checks, 2026-10-06
+
+An already-published, hash-verified factor version does not expire with wall time.
+The legacy manifest field `valid_until_ms` remains unchanged on disk and denotes
+the next source-check deadline. Agent reads use `FactorReadPolicy::published_version`:
+future observations, malformed proofs, missing data, rollback and coverage errors
+still fail, but a missed check alone does not disable query or `adjust_rows`.
+The normal demand-driven current-pointer TTL and all resource limits are unchanged;
+network/validation errors never silently substitute an old version after refresh fails.
+
+Internal UDS replies explicitly declare `factor_freshness_policy=versioned-v1`,
+`factor_observed_at_ms`, `factor_next_check_ms`, `factor_evaluated_at_ms` and
+`factor_check_status=current|overdue`. The old deadline field is retained without
+extension. Compact v2/v3 reads both identify the immutable data hash, so a check-only
+publication does not change the data version. No persisted object/schema rewrite.
+
+Deploy the matching Cloud UDS validator before enabling adjusted client traffic.
+Old Cloud cannot interpret the new overdue-result policy. Old Agent responses
+retain their original strict contract in the upgraded Cloud; SDK bytes do not change.
+"Overdue" explicitly means latest-source synchronization is unconfirmed, not proof
+that corporate-action coverage is up to date. It is visible in Cloud's served log.
+
+New publication dispatch still requires a timely source observation and CAS/journal
+validation. Keeping that write-time guard prevents an abandoned old capture from
+replacing a newer publication; it is not an expiration policy for stored factors.
+Existing immutable-object reuse means unchanged factor data is not uploaded again.
+
 ## Native composite adjustment, 2026-10-02
 
 With `--adjustment yes`, a trusted same-host gateway can send `ADJUST64\n`
@@ -11,7 +38,7 @@ followed by one JSON `op=adjust_rows` request. The frame is bounded to
 5000 native64 rows plus 8 KiB metadata; ordinary requests remain limited to
 8 KiB. It includes the original UTC half-open range, mode, `input_adjust=none`,
 raw row hash, `prefix_rows`, `prefix_end_ms`, and an optional same-host
-`deadline_mono_ms`. One fresh factor snapshot adjusts the combined raw result;
+`deadline_mono_ms`. One verified factor version adjusts the combined raw result;
 the cumulative forward anchor uses the final returned row, not the prefix.
 Only prices change. The response is marked `gateway-raw-composite-v1`, not
 an R2 coverage proof or an atomic DDB/R2 snapshot. No DDB credentials are

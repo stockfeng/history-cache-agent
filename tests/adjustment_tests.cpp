@@ -37,6 +37,18 @@ int main() {
     };
     auto parsed = parse(document);
     {
+        const auto text = document.dump(); const Bytes bytes(text.begin(), text.end());
+        const auto saved = parse_factor_snapshot(bytes, sha256(bytes), "000001.SZ", "SZ", 2000,
+            FactorReadPolicy::published_version);
+        check(saved.factors.factor_set_hash == parsed.factors.factor_set_hash);
+        check(saved.valid_until_ms == 2000 && saved.observed_at_ms == 1000);
+        check(parse_factor_snapshot(bytes, sha256(bytes), "000001.SZ", "SZ", 365LL * 86400000,
+            FactorReadPolicy::published_version).factors.events[0].cumulative == 2.0);
+        rejects([&] { parse_factor_snapshot(bytes, sha256(bytes), "000001.SZ", "SZ", 999,
+            FactorReadPolicy::published_version); });
+        rejects([&] { parse_factor_snapshot(bytes, sha256(bytes), "000001.SZ", "SZ", 2000); });
+    }
+    {
         constexpr int64_t day = 20728;
         auto scheduled = document;
         const auto observed = day * 86400000 + 1000;
@@ -54,6 +66,10 @@ int main() {
         };
         check(read(scheduled, observed + 2 * 86400000).source_revision == 1);
         rejects([&] { read(scheduled, until); });
+        const auto scheduled_text = scheduled.dump();
+        const Bytes scheduled_bytes(scheduled_text.begin(), scheduled_text.end());
+        check(parse_factor_snapshot(scheduled_bytes, sha256(scheduled_bytes), "000001.SZ", "SZ", until,
+            FactorReadPolicy::published_version).source_revision == 1);
         auto bad = scheduled; bad["verification"]["next_check_ms"] = until + 1;
         rejects([&] { read(bad, observed); });
         bad = scheduled; bad["verification"]["exchange"] = "XNYS";
@@ -129,6 +145,10 @@ int main() {
         rejects([&] { resolve(reference, bad); });
         auto expired_ref = reference; expired_ref["valid_until_ms"] = 1400;
         rejects([&] { resolve(expired_ref, payload); });
+        const auto old_text = expired_ref.dump(); const Bytes old_ref(old_text.begin(), old_text.end());
+        const auto old = resolve_factor_snapshot(old_ref, sha256(old_ref), payload, "000001.SZ", "SZ", 1500,
+            FactorReadPolicy::published_version);
+        check(old.factors.factor_set_hash == sha256(payload) && old.valid_until_ms == 1400);
         auto mismatch = reference; mismatch["first_day"] = 0;
         rejects([&] { resolve(mismatch, payload); });
         auto wrong_size = reference; wrong_size["factor_data_bytes"] = payload.size() + 1;

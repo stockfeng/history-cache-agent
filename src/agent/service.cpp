@@ -70,6 +70,18 @@ int64_t wall_now_ms() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+Json factor_metadata(const FactorSnapshot& snapshot, const AdjustmentSnapshot& factors) {
+    const auto now = wall_now_ms();
+    if (snapshot.observed_at_ms > now) throw Error(ErrorCode::corrupt, "factor observation is future-dated");
+    return {{"algorithm", "upcloud-adjustment-v1"}, {"factor_set_hash", hex(factors.factor_set_hash)},
+        {"factor_source_epoch", snapshot.source_epoch},
+        {"model", factors.model == AdjustmentModel::cumulative ? "cumulative" : "futu_ab"},
+        {"factor_freshness_policy", "versioned-v1"}, {"factor_observed_at_ms", snapshot.observed_at_ms},
+        {"factor_evaluated_at_ms", now}, {"factor_next_check_ms", snapshot.valid_until_ms},
+        {"factor_check_status", now < snapshot.valid_until_ms ? "current" : "overdue"},
+        {"factor_valid_until_ms", snapshot.valid_until_ms}};
+}
+
 std::string market_of(const std::string& symbol) {
     static const std::regex stock("[0-9]{6}\\.(SH|SZ)");
     static const std::regex hk("[0-9]{5}\\.HK");
@@ -270,7 +282,7 @@ std::shared_ptr<const FactorSnapshot> Agent::get_factors(const std::string& name
         std::lock_guard<std::mutex> guard(cache_mutex_);
         const auto found = factors_.find(name);
         if (found != factors_.end()) previous = found->second;
-        if (previous && wall_now_ms() < previous->snapshot->valid_until_ms &&
+        if (previous && wall_now_ms() >= previous->snapshot->observed_at_ms &&
             SteadyClock::now() - previous->fetched_at <
                 std::chrono::seconds(std::min<uint64_t>(15, config_.manifest_ttl_seconds))) {
             query.metrics["factor_hits"] = query.metrics.value("factor_hits", uint64_t{0}) + 1;
@@ -292,16 +304,18 @@ std::shared_ptr<const FactorSnapshot> Agent::get_factors(const std::string& name
         throw Error(ErrorCode::conflict, "factor current regressed or changed at same sequence");
     std::shared_ptr<const FactorSnapshot> snapshot;
     if (previous && serialize_pointer(pointer) == serialize_pointer(previous->pointer)) {
-        if (wall_now_ms() >= previous->snapshot->valid_until_ms)
-            throw Error(ErrorCode::missing, "adjustment factors expired");
+        if (wall_now_ms() < previous->snapshot->observed_at_ms)
+            throw Error(ErrorCode::corrupt, "factor observation is future-dated");
         snapshot = previous->snapshot;
     } else {
         const auto bytes = read_with_retry([&] { return store->get(pointer.manifest_key, kMaxFactorBytes); }, query.limits.deadline);
-        auto parsed = parse_factor_snapshot(bytes, pointer.manifest_sha256, symbol, market, wall_now_ms());
+        auto parsed = parse_factor_snapshot(bytes, pointer.manifest_sha256, symbol, market, wall_now_ms(),
+            FactorReadPolicy::published_version);
         if (parsed.data_hash != Digest{}) {
             const auto key = "manifests/v1/" + hex(parsed.data_hash) + ".json";
             const auto data = read_with_retry([&] { return store->get(key, parsed.data_bytes); }, query.limits.deadline);
-            parsed = resolve_factor_snapshot(bytes, pointer.manifest_sha256, data, symbol, market, wall_now_ms());
+            parsed = resolve_factor_snapshot(bytes, pointer.manifest_sha256, data, symbol, market, wall_now_ms(),
+                FactorReadPolicy::published_version);
         }
         snapshot = std::make_shared<const FactorSnapshot>(std::move(parsed));
         if (snapshot->source_epoch != pointer.dataset_epoch)
@@ -513,19 +527,17 @@ Json Agent::query(const Json& request, QueryContext& query) {
                 const auto bytes = canonical_native(row);
                 result.insert(result.end(), bytes.begin(), bytes.end());
             }
-            if (query.limits.cancelled->load() || SteadyClock::now() >= query.limits.deadline ||
-                wall_now_ms() >= snapshot->valid_until_ms)
-                throw Error(ErrorCode::resource_limit, "adjustment expired or query deadline reached");
+            if (query.limits.cancelled->load() || SteadyClock::now() >= query.limits.deadline)
+                throw Error(ErrorCode::resource_limit, "adjustment query deadline reached");
+            auto metadata = factor_metadata(*snapshot, factors);
+            metadata["anchor_day"] = query.adjust == "forward" && factors.model == AdjustmentModel::cumulative &&
+                !days.empty() ? Json(days.back()) : Json(nullptr);
             return {{"status", "HIT"}, {"result_kind", "gateway-raw-composite-v1"},
                 {"rows", output.size()}, {"first_ms", rows.empty() ? 0 : rows.front().timestamp_ms},
                 {"last_ms", rows.empty() ? 0 : rows.back().timestamp_ms},
                 {"rows_sha256", hex(sha256(result))}, {"data", hex(result.data(), result.size())},
                 {"input_rows_sha256", hex(sha256(data))}, {"prefix_rows", prefix_rows}, {"prefix_end_ms", split},
-                {"adjustment", {{"algorithm", "upcloud-adjustment-v1"}, {"factor_set_hash", hex(factors.factor_set_hash)},
-                    {"factor_source_epoch", snapshot->source_epoch}, {"factor_valid_until_ms", snapshot->valid_until_ms},
-                    {"model", factors.model == AdjustmentModel::cumulative ? "cumulative" : "futu_ab"},
-                    {"anchor_day", query.adjust == "forward" && factors.model == AdjustmentModel::cumulative &&
-                        !days.empty() ? Json(days.back()) : Json(nullptr)}}}};
+                {"adjustment", std::move(metadata)}};
         }
         if ((intraday || allow_partial) && !query.native)
             throw Error(ErrorCode::invalid, "partial and intraday queries require native64");
@@ -661,18 +673,14 @@ Json Agent::query(const Json& request, QueryContext& query) {
                 (stored_end - 1 + (clock ? 0 : 28800000)) / 86400000 + 1);
             const auto output = adjust_native_rows(symbol, adjustment_rows, adjustment_days, factors,
                 query.adjust == "forward" ? AdjustmentMode::forward : AdjustmentMode::backward);
-            if (query.limits.cancelled->load() || SteadyClock::now() >= query.limits.deadline ||
-                wall_now_ms() >= factor_snapshot->valid_until_ms)
-                throw Error(ErrorCode::resource_limit, "adjustment expired or query deadline reached");
+            if (query.limits.cancelled->load() || SteadyClock::now() >= query.limits.deadline)
+                throw Error(ErrorCode::resource_limit, "adjustment query deadline reached");
             for (const auto& row : output) {
                 const auto bytes = canonical_native(row);
                 data.insert(data.end(), bytes.begin(), bytes.end());
                 hash.update(bytes);
             }
-            adjustment = {{"algorithm", "upcloud-adjustment-v1"}, {"factor_set_hash", hex(factors.factor_set_hash)},
-                {"factor_source_epoch", factor_snapshot->source_epoch},
-                {"model", factors.model == AdjustmentModel::cumulative ? "cumulative" : "futu_ab"},
-                {"factor_valid_until_ms", factor_snapshot->valid_until_ms}};
+            adjustment = factor_metadata(*factor_snapshot, factors);
             adjustment["anchor_day"] = query.adjust == "forward" && factors.model == AdjustmentModel::cumulative &&
                 !adjustment_days.empty() ? Json(adjustment_days.back()) : Json(nullptr);
         }

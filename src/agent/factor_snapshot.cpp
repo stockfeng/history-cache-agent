@@ -57,7 +57,7 @@ void verification(const Json& value, const std::string& market, int64_t observed
 }  // namespace
 
 FactorSnapshot parse_factor_snapshot(const Bytes& bytes, const Digest& expected_hash,
-    const std::string& symbol, const std::string& market, int64_t now_ms, bool require_fresh) {
+    const std::string& symbol, const std::string& market, int64_t now_ms, FactorReadPolicy policy) {
     require(bytes.size() <= kMaxFactorBytes && sha256(bytes) == expected_hash, "factor digest/size mismatch");
     size_t events = 0;
     std::vector<std::set<std::string>> object_keys;
@@ -94,7 +94,8 @@ FactorSnapshot parse_factor_snapshot(const Bytes& bytes, const Digest& expected_
     result.observed_at_ms = integer(json.at("observed_at_ms"));
     result.valid_until_ms = integer(json.at("valid_until_ms"));
     require(result.observed_at_ms > 0 && result.observed_at_ms < result.valid_until_ms &&
-        (!require_fresh || (result.observed_at_ms <= now_ms && now_ms < result.valid_until_ms)) &&
+        (policy == FactorReadPolicy::structural_only || result.observed_at_ms <= now_ms) &&
+        (policy != FactorReadPolicy::fresh_publication || now_ms < result.valid_until_ms) &&
         result.valid_until_ms - result.observed_at_ms <= (scheduled ? 16LL * 86400000 : 86400000),
         "factor snapshot expired or future-dated");
     if (scheduled) {
@@ -165,8 +166,8 @@ FactorSnapshot parse_factor_snapshot(const Bytes& bytes, const Digest& expected_
 }
 
 FactorSnapshot resolve_factor_snapshot(const Bytes& reference, const Digest& expected_hash,
-    const Bytes& data, const std::string& symbol, const std::string& market, int64_t now_ms, bool require_fresh) {
-    const auto header = parse_factor_snapshot(reference, expected_hash, symbol, market, now_ms, require_fresh);
+    const Bytes& data, const std::string& symbol, const std::string& market, int64_t now_ms, FactorReadPolicy policy) {
+    const auto header = parse_factor_snapshot(reference, expected_hash, symbol, market, now_ms, policy);
     require(header.data_hash != Digest{} && data.size() == header.data_bytes && sha256(data) == header.data_hash,
             "factor data digest/length differs");
     // Validate duplicate keys/depth before using Json::parse's object projection.
@@ -194,8 +195,9 @@ FactorSnapshot resolve_factor_snapshot(const Bytes& reference, const Digest& exp
     joined["rows"] = content.at("rows");
     const auto encoded = joined.dump();
     const Bytes bytes(encoded.begin(), encoded.end());
-    auto result = parse_factor_snapshot(bytes, sha256(bytes), symbol, market, now_ms, require_fresh);
-    result.factors.factor_set_hash = joined.contains("verification") ? header.data_hash : expected_hash;
+    auto result = parse_factor_snapshot(bytes, sha256(bytes), symbol, market, now_ms, policy);
+    result.factors.factor_set_hash = joined.contains("verification") || policy == FactorReadPolicy::published_version
+        ? header.data_hash : expected_hash;
     result.data_hash = header.data_hash; result.data_bytes = header.data_bytes;
     return result;
 }
