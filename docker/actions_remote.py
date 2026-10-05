@@ -1,6 +1,7 @@
 """Host-side Actions adapter for the journaled Agent deployer; no Cloud mutations."""
 
 from contextlib import contextmanager
+import copy
 import fcntl
 import json
 import os
@@ -23,6 +24,24 @@ MIB = 1024 * 1024
 
 class ActionsError(ValueError):
     pass
+
+
+def fingerprint_default_differences(current, expected):
+    """Hash-only diagnosis of one-field Docker default normalization; never authorize it."""
+    matches = []
+    for section in ('HostConfig', 'Config'):
+        for key in sorted(current[section]):
+            if key in ('Env', 'Labels', 'Cmd', 'Entrypoint', 'Binds', 'PortBindings'):
+                continue
+            value = current[section][key]
+            if value not in (None, '', False, 0, [], {}, 'runc'):
+                continue
+            for candidate in (None, '', False, 0, [], {}, 'runc'):
+                changed = copy.deepcopy(current)
+                changed[section][key] = candidate
+                if deploy.fingerprint(changed) == expected:
+                    matches.append(dict(field=section + '.' + key, recorded=candidate, current=value))
+    return matches
 
 
 def require(value, message):
@@ -199,6 +218,9 @@ def operate(request, bundle):
                     candidate_config_matches=deploy.fingerprint(current) == record['candidate_fingerprint'],
                     candidate_files_match=deploy.config_files(current, app.socket_dir) == record['candidate_files'],
                     running=current['State']['Running'], restarts=current['RestartCount'])
+                if not result['candidate_config_matches']:
+                    result['single_default_differences'] = fingerprint_default_differences(
+                        current, record['candidate_fingerprint'])
                 try:
                     app.probe(str(app.socket_dir / 'agent.sock'))
                     result['uds_ping'] = True
