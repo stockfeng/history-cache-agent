@@ -34,13 +34,17 @@ def fingerprint_default_differences(current, expected):
             if key in ('Env', 'Labels', 'Cmd', 'Entrypoint', 'Binds', 'PortBindings'):
                 continue
             value = current[section][key]
-            if value not in (None, '', False, 0, [], {}, 'runc'):
-                continue
-            for candidate in (None, '', False, 0, [], {}, 'runc'):
+            for candidate in (None, '', False, 0, -1, [], {}, 'runc'):
                 changed = copy.deepcopy(current)
                 changed[section][key] = candidate
                 if deploy.fingerprint(changed) == expected:
-                    matches.append(dict(field=section + '.' + key, recorded=candidate, current=value))
+                    matches.append(dict(field=section + '.' + key, recorded=candidate,
+                                        current_type=type(value).__name__))
+            changed = copy.deepcopy(current)
+            del changed[section][key]
+            if deploy.fingerprint(changed) == expected:
+                matches.append(dict(field=section + '.' + key, recorded_missing=True,
+                                    current_type=type(value).__name__))
     return matches
 
 
