@@ -101,7 +101,8 @@ void publish(Peer& peer, const std::string& month, hc::Coverage coverage, uint64
     if (!empty && rows.empty()) rows.push_back({coverage.start_ms, 10, 11, 9, 10, 100});
     if (native) for (auto& row : rows)
         row.native = hc::Row::NativeFields{{10, 11, 9, 10}, 100, 101};
-    const auto market = symbol == "000001.SZ" ? "SZ" : symbol == "AP612C8000.CZC" ? "CZC" : "US";
+    const auto market = symbol == "000001.SZ" ? "SZ" : symbol == "00700.HK" ? "HK" :
+        symbol == "AP612C8000.CZC" ? "CZC" : "US";
     hc::CatalogEntry entry{{native ? "ddb-history-native64" : full ? "ddb-history-kline48" : "ddb-history-snapshot", market, symbol, 60, "none"},
         test::version(), seq, coverage, rows.size(), std::nullopt};
     hc::Bytes pack;
@@ -242,9 +243,13 @@ void adjustment_service_tests() {
         hc::Agent compact(strict, peer);
         const auto result = compact.handle_query(input);
         check(result.at("status") == "HIT" && result.at("data") == after.at("data"), "compact factor changed result");
+        check(result.at("adjustment").at("factor_set_hash") == hc::hex(hc::sha256(payload)), "reference-v2 data version differs");
         ref["observed_at_ms"] = ref.at("observed_at_ms").get<int64_t>() + 1;
         publish_factors(*peer, ref, 4);
-        check(compact.handle_query(input).at("data") == after.at("data"), "compact refresh changed result");
+        const auto renewed = compact.handle_query(input);
+        check(renewed.at("data") == after.at("data") &&
+            renewed.at("adjustment").at("factor_set_hash") == result.at("adjustment").at("factor_set_hash"),
+            "check-only renewal changed data version or result");
         auto scheduled = ref;
         const auto observed = ref.at("observed_at_ms").get<int64_t>();
         const auto check_day = (observed + 28800000) / 86400000 - 1;
@@ -329,6 +334,82 @@ void adjustment_service_tests() {
     check(us_agent.handle_query(us_input).at("data") == us_result.at("data"), "composite US civil day differs");
     std::cout << "PASS agent_adjustment_us local_date affine_native same_sequence_guard\n";
     std::cout << "PASS agent_adjustment default_off cold5 hot0 native64 anchor revision rollback expiry partial_reject\n";
+}
+
+void versioned_factor_tests() {
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    for (const std::string symbol : {"000001.SZ", "00700.HK", "AAPL"}) {
+        const bool us = symbol == "AAPL";
+        const auto market = us ? "US" : symbol == "00700.HK" ? "HK" : "SZ";
+        const auto slug = us ? "aapl-us" : symbol == "00700.HK" ? "00700hk" : "000001sz";
+        auto peer = std::make_shared<Peer>();
+        const int64_t stored = us ? boundary + 28800000 : boundary;
+        hc::NewYorkClock clock;
+        const int64_t start = us ? clock.to_utc(stored) : stored;
+        publish(*peer, "202610", {stored, stored + 60000}, 1, false, symbol, {}, false, true);
+        auto factor = factor_fixture(symbol, market);
+        if (us) {
+            factor["model"] = "futu_ab";
+            factor["rows"] = Json::array({{{"code", symbol}, {"ex_div_date", (stored / 86400000) + 1},
+                {"forward_adj_factorA", 0.5}, {"forward_adj_factorB", 0.125},
+                {"backward_adj_factorA", 2.0}, {"backward_adj_factorB", 0.0}, {"update_time", 1}}});
+        }
+        auto cfg = config(); cfg.enable_adjustment = true;
+        publish_factors(*peer, factor, 1, slug);
+        auto input = request(start, start + 60000);
+        input["symbol"] = symbol; input["row_encoding"] = "le-ddb-native64-v1";
+        std::vector<Json> expected;
+        hc::Agent fresh(cfg, peer);
+        for (const std::string mode : {"forward", "backward"}) {
+            input["adjust"] = mode;
+            expected.push_back(fresh.handle_query(input));
+            check(expected.back().at("status") == "HIT", "fresh reference failed");
+        }
+        // A genuine old observation, not an invalid zero-length interval.
+        factor["observed_at_ms"] = now - 30LL * 86400000;
+        factor["valid_until_ms"] = now - 30LL * 86400000 + 3600000;
+        publish_factors(*peer, factor, 2, slug);
+        hc::Agent cold(cfg, peer);
+        auto strict = cfg; strict.manifest_ttl_seconds = 0;
+        hc::Agent recheck(strict, peer);
+        for (size_t index = 0; index < 2; ++index) {
+            input["adjust"] = index == 0 ? "forward" : "backward";
+            const auto result = cold.handle_query(input);
+            check(result.at("status") == "HIT" && result.at("data") == expected[index].at("data"),
+                  "verification age changed adjusted rows");
+            const auto& meta = result.at("adjustment");
+            check(meta.at("factor_freshness_policy") == "versioned-v1" && meta.at("factor_check_status") == "overdue" &&
+                  meta.at("factor_observed_at_ms") == factor.at("observed_at_ms") &&
+                  meta.at("factor_next_check_ms") == factor.at("valid_until_ms"), "lost check status or rewrote time");
+            const auto calls = peer->calls;
+            check(cold.handle_query(input).at("data") == result.at("data") && peer->calls == calls,
+                  "overdue hot read bypassed normal TTL");
+            check(recheck.handle_query(input).at("data") == result.at("data") &&
+                  recheck.handle_query(input).at("data") == result.at("data"), "unchanged current rejected on recheck");
+            hc::Row raw{start, 10, 11, 9, 10, 100};
+            raw.native = hc::Row::NativeFields{{10, 11, 9, 10}, 100, 101};
+            const auto bytes = hc::canonical_native(raw);
+            auto composite = input;
+            composite.update(Json{{"op", "adjust_rows"}, {"input_adjust", "none"}, {"prefix_rows", 1},
+                {"prefix_end_ms", start + 60000}, {"data", hc::hex(bytes)},
+                {"rows_sha256", hc::hex(hc::sha256(hc::Bytes(bytes.begin(), bytes.end())))}});
+            check(cold.handle_query(composite).at("data") == result.at("data"), "overdue composite failed");
+        }
+        auto correction = factor;
+        correction["rows"][0][us ? "forward_adj_factorA" : "cum_factor"] = 3.0;
+        publish_factors(*peer, correction, 3, slug);
+        input["adjust"] = us ? "forward" : "backward";
+        check(recheck.handle_query(input).at("data") != expected[us ? 0 : 1].at("data"), "new version was not applied");
+        peer->failure = hc::HttpFailure::deadline;
+        check(recheck.handle_query(input).at("status") == "ERROR", "network error silently reused old version");
+        peer->failure = hc::HttpFailure::none;
+        auto future = correction;
+        future["observed_at_ms"] = now + 3600000; future["valid_until_ms"] = now + 7200000;
+        publish_factors(*peer, future, 4, slug);
+        check(recheck.handle_query(input).at("status") == "ERROR", "future observation accepted");
+    }
+    std::cout << "PASS versioned_factors AH_US cold hot recheck composite correction clock network\n";
 }
 
 Json intraday_tests() {
@@ -931,6 +1012,7 @@ int main(int argc, char** argv) {
             maintenance_tests();
             demand_tests();
             adjustment_service_tests();
+            versioned_factor_tests();
             auto vectors = market_tests();
             for (const auto& vector : intraday) vectors.push_back(vector);
             const auto complete = complete_tests();

@@ -107,7 +107,7 @@ Pointer make_target(const Manifest& candidate, uint64_t expected_seq) {
 
 Pointer factor_target(const Bytes& bytes, const std::string& symbol, const std::string& market,
                       const std::optional<Pointer>& base) {
-    const auto parsed = parse_factor_snapshot(bytes, sha256(bytes), symbol, market, 0, false);
+    const auto parsed = parse_factor_snapshot(bytes, sha256(bytes), symbol, market, 0, FactorReadPolicy::structural_only);
     const auto seq = base ? base->publication_seq : 0;
     detail::require(seq < UINT64_MAX, "factor sequence exhausted", ErrorCode::resource_limit);
     const Pointer target{parsed.source_epoch, seq + 1, "manifests/v1/" + hex(sha256(bytes)) + ".json", sha256(bytes)};

@@ -101,7 +101,8 @@ Bundle bundle(const fs::path& root, bool fresh) {
              hc::read_file(root / "source-0.json", hc::kMaxMetadataBytes), {}};
     b.document = Json::parse(b.factor);
     const auto& f = b.document;
-    (void)hc::parse_factor_snapshot(b.factor, hc::sha256(b.factor), f.at("symbol"), f.at("market"), now_ms(), fresh);
+    (void)hc::parse_factor_snapshot(b.factor, hc::sha256(b.factor), f.at("symbol"), f.at("market"), now_ms(),
+        fresh ? hc::FactorReadPolicy::fresh_publication : hc::FactorReadPolicy::structural_only);
     const auto p = Json::parse(b.proof), s = Json::parse(b.source);
     const auto& plan = p.at("plan");
     require(plan.contains("verification") == f.contains("verification"), "verification plan presence differs");

@@ -17,7 +17,7 @@ PublishResult publish_factors(ObjectStore& store, const Bytes& bytes,
     const std::string& symbol, const std::string& market,
     const std::optional<Pointer>& expected_base, const std::function<int64_t()>& now_ms, bool recover_only) {
     const auto hash = sha256(bytes);
-    const auto candidate = parse_factor_snapshot(bytes, hash, symbol, market, now_ms(), false);
+    const auto candidate = parse_factor_snapshot(bytes, hash, symbol, market, now_ms(), FactorReadPolicy::structural_only);
     const auto seq = expected_base ? expected_base->publication_seq : 0;
     if (seq == UINT64_MAX) throw Error(ErrorCode::resource_limit, "factor sequence exhausted");
     const Pointer target{candidate.source_epoch, seq + 1, "manifests/v1/" + hex(hash) + ".json", hash};
@@ -33,7 +33,7 @@ PublishResult publish_factors(ObjectStore& store, const Bytes& bytes,
                 throw Error(ErrorCode::corrupt, "factor recovery content mismatch");
             if (candidate.data_hash != Digest{}) {
                 const auto data = store.get("manifests/v1/" + hex(candidate.data_hash) + ".json", candidate.data_bytes);
-                (void)resolve_factor_snapshot(bytes, hash, data, symbol, market, now_ms(), false);
+                (void)resolve_factor_snapshot(bytes, hash, data, symbol, market, now_ms(), FactorReadPolicy::structural_only);
             }
             return {PublishOutcome::committed, target, true};
         }
@@ -51,7 +51,7 @@ PublishResult publish_factors(ObjectStore& store, const Bytes& bytes,
         // Expired snapshots can be replaced. Validate their original interval,
         // rather than treating expiry as permission to reset the publication.
         const auto old = parse_factor_snapshot(old_bytes, observed->manifest_sha256, symbol, market,
-            candidate.observed_at_ms, false);
+            candidate.observed_at_ms, FactorReadPolicy::structural_only);
         if (old.source_epoch != observed->dataset_epoch || old.source_epoch != candidate.source_epoch ||
             old.factors.model != candidate.factors.model ||
             candidate.factors.first_day > old.factors.first_day || candidate.factors.end_day < old.factors.end_day ||
