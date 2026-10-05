@@ -260,7 +260,14 @@ class HostTests(unittest.TestCase):
             self.assertEqual(remote.operate(request('preflight'), self.root)['status'], 'PREFLIGHT_OK')
             self.assertEqual(before, docker.calls)
             self.assertEqual(remote.operate(request(), self.root)['status'], 'COMMITTED')
-            self.assertEqual(remote.operate(request('status'), self.root)['phase'], 'COMMITTED')
+            before = len(docker.calls)
+            status = remote.operate(request('status'), self.root)
+            self.assertEqual(status['phase'], 'COMMITTED')
+            for field in ('candidate_identity_matches', 'candidate_image_matches', 'candidate_label_matches',
+                          'candidate_config_matches', 'candidate_files_match', 'running', 'uds_ping'):
+                self.assertTrue(status[field])
+            self.assertFalse(status['backup_present'])
+            self.assertTrue(all(call[0] in ('ps', 'inspect') for call in docker.calls[before:]))
             with self.assertRaises(ValueError):
                 remote.operate(request(), self.root)
             self.assertEqual(remote.operate(request('rollback'), self.root)['status'], 'ROLLED_BACK')

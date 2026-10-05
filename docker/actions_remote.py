@@ -184,7 +184,29 @@ def operate(request, bundle):
     if operation == 'status':
         with app.journal.lock():
             record = app.journal.read()
-        return {key: record[key] for key in ('transaction', 'phase', 'pending')} if record else {'phase': 'EMPTY'}
+            if not record:
+                return {'phase': 'EMPTY'}
+            result = {key: record[key] for key in ('transaction', 'phase', 'pending')}
+            app.docker.budget(30)
+            current = app.docker.inspect(deploy.NAME)
+            backup = app.docker.inspect(deploy.BACKUP)
+            result.update(candidate_present=current is not None, backup_present=backup is not None,
+                          previous_container_recorded=record['old'] is not None)
+            if current:
+                result.update(candidate_identity_matches=current['Id'] == record['candidate'],
+                    candidate_image_matches=current['Image'] == record['image_id'],
+                    candidate_label_matches=current['Config'].get('Labels', {}).get(deploy.LABEL) == record['transaction'],
+                    candidate_config_matches=deploy.matches_fingerprint(current, record['candidate_fingerprint']),
+                    candidate_files_match=deploy.config_files(current, app.socket_dir) == record['candidate_files'],
+                    running=current['State']['Running'], restarts=current['RestartCount'])
+                result['docker_oom_default_equivalent'] = result['candidate_config_matches'] and \
+                    deploy.fingerprint(current) != record['candidate_fingerprint']
+                try:
+                    app.probe(str(app.socket_dir / 'agent.sock'))
+                    result['uds_ping'] = True
+                except (ValueError, OSError):
+                    result['uds_ping'] = False
+            return result
     if operation in ('preflight', 'deploy'):
         credentials, profile = config_paths(bundle)
         resources = resource_preflight()

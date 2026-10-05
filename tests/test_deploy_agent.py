@@ -124,6 +124,36 @@ class DeployTests(unittest.TestCase):
         for flag, value in [('--memory', '128m'), ('--memory-swap', '128m'), ('--cpus', '0.25'), ('--pids-limit', '32')]:
             self.assertEqual(create[create.index(flag) + 1], value)
 
+    def test_fingerprint_only_normalizes_explicit_false_null_oom_default(self):
+        before = container(NEW, deploy.NAME)
+        before['HostConfig']['OomKillDisable'] = False
+        after = copy.deepcopy(before)
+        after['HostConfig']['OomKillDisable'] = None
+        self.assertTrue(deploy.matches_fingerprint(after, deploy.fingerprint(before)))
+        self.assertTrue(deploy.matches_fingerprint(before, deploy.fingerprint(after)))
+        for change in ({'OomKillDisable': True}, {'OomKillDisable': 0}, {'Memory': 1},
+                       {'NanoCpus': 1000000000}, {'Privileged': True}):
+            changed = copy.deepcopy(after)
+            changed['HostConfig'].update(change)
+            self.assertFalse(deploy.matches_fingerprint(changed, deploy.fingerprint(before)))
+        missing = copy.deepcopy(after)
+        del missing['HostConfig']['OomKillDisable']
+        self.assertFalse(deploy.matches_fingerprint(missing, deploy.fingerprint(before)))
+
+    def test_accept_after_docker_materializes_oom_default(self):
+        def normalize(args):
+            if args[0] == 'create':
+                self.docker.containers[NEW]['HostConfig']['OomKillDisable'] = False
+            elif args[0] == 'start':
+                self.docker.containers[NEW]['HostConfig']['OomKillDisable'] = None
+        self.docker.on_mutation = normalize
+        self.assertEqual(self.run_deploy(), 'COMMITTED')
+        recorded = self.app.journal.read()['candidate_fingerprint']
+        self.assertEqual(self.instance().accept(), 'ACCEPTED')
+        self.assertEqual(self.app.journal.read()['candidate_fingerprint'], recorded)
+        self.assertTrue(self.docker.containers[NEW]['State']['Running'])
+        self.assertNotIn(OLD, self.docker.containers)
+
     def test_pull_failure_preserves_running_old(self):
         self.docker.fail_before = 'pull'
         with self.assertRaises(deploy.DeployError):
