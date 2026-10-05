@@ -1,8 +1,131 @@
 # history-cache
 
-C++17 core for the R2 historical-cache project. This is an independent local Git
-repository inside the integration workspace. No remote, commit, release, bucket
-or service is created by the implementation.
+C++17 core and UDS agent for the R2 historical-cache project. This is an
+independent Git repository inside the integration workspace. Building or testing
+the component does not deploy services or publish data.
+
+## Native composite adjustment, 2026-10-02
+
+With `--adjustment yes`, a trusted same-host gateway can send `ADJUST64\n`
+followed by one JSON `op=adjust_rows` request. The frame is bounded to
+5000 native64 rows plus 8 KiB metadata; ordinary requests remain limited to
+8 KiB. It includes the original UTC half-open range, mode, `input_adjust=none`,
+raw row hash, `prefix_rows`, `prefix_end_ms`, and an optional same-host
+`deadline_mono_ms`. One fresh factor snapshot adjusts the combined raw result;
+the cumulative forward anchor uses the final returned row, not the prefix.
+Only prices change. The response is marked `gateway-raw-composite-v1`, not
+an R2 coverage proof or an atomic DDB/R2 snapshot. No DDB credentials are
+installed in the agent. Ordinary adjusted PARTIAL requests still fail closed.
+
+The paired gateway uses a bounded internal native64 upstream tail channel,
+then projects the final result to the unchanged SDK 48-byte wire format.
+No worker, realtime queue or cache capacity is increased. Deployment and
+2000-client resource acceptance remain separate gates.
+
+## Data-side publisher connection reuse, 2026-09-30
+
+The snapshot CLI now opts into a separate publication reuse policy: verified,
+fully received GET 2xx/404 and PUT 200 responses may keep the connection.
+Agent read-only reuse behavior and legacy sample/staging tools are unchanged.
+TLS/transport errors and 412 responses discard the handle; conditional writes,
+readback validation, journals and request/byte/deadline budgets are unchanged.
+No application retry loop is added. Reuse is per CLI process, not across timer ticks.
+Snapshot diagnostics include numeric `curl_code` and `tls_verify_result`, without
+URLs, credentials or raw error strings. A zero verify result alone does not prove
+TLS success; the delivery and failure fields still apply.
+
+Integration loopback-TLS tests measured 18 requests / 18 new connections before,
+versus 18 / 1 after, with identical native64 rows. They also cover signed header
+reset, conditional replacement/conflict, uncertain write readback, journal recovery
+and CA rejection. Full curl-ON CTest: 74/74. No production or live pilot binary
+is replaced by this source change; external-R2 stability is not yet measured.
+
+## DDB-native schema, 2026-09-29
+
+The selected archive contract is now `le-ddb-native64-v1`: timestamp, DOUBLE
+OHLC, LONG volume/open_oi/close_oi (`<q4d3q`, 64 bytes). No amount is required.
+Integration tools expose `--native-kline`; dataset `ddb-history-native64`, pack
+row schema 3, and `-native64-001` namespaces isolate it from older formats.
+Agent and Cloud internal UDS reads preserve all fields. Cloud prefer explicitly
+projects native rows to the existing 48-byte SDK response, matching upcloud's
+OHLCV history projection (float32 prices, zero turnover/open_interest). No SDK
+upgrade is required; native bytes must never be copied directly to legacy wire rows.
+
+## Complete historical rows, 2026-09-29
+
+UDS queries may request `row_encoding=le-kline48-v1` (48-byte canonical
+timestamp/OHLC/volume/turnover/open-interest rows). This uses pack row schema 2,
+dataset `ddb-history-kline48`, and a separate `-kline48-001` namespace. Legacy
+OHLCV archives cannot satisfy complete-row queries. The snapshot publisher now
+supports schema 2 and requires an isolated `-kline48-` namespace. Integration
+exporters offer explicit `--complete-kline`; missing source amount/open_oi fails
+closed. Existing saved DDB schemas lack amount, so no live complete-row archive
+has been published by this migration.
+Cloud's opt-in `HISTORY_CACHE_MODE=prefer` can return validated complete rows;
+default remains shadow. No deployment is implied by these source changes.
+
+## Realtime-first maintenance, 2026-09-29
+
+Correction: default foreground now fetches R2 on local miss/expiry. Cold reads
+are serialized with deadline-bounded waiting and 512 KiB/s receive pacing;
+foreground demand cancels background work. Cache-only is opt-in diagnostic mode.
+See the latest section of `deploy/README.md`; the following defaults are historical.
+
+Defaults now favor realtime isolation: cache-only foreground, two workers/four
+pending sockets, 32 MiB pack cache. Optional explicit warm plans use one paced,
+budgeted worker and a renewable same-host idle lease; without a valid lease no
+background HTTP starts. Matching Cloud integration permits maintenance only
+with zero connected clients. See `deploy/README.md` for opt-in/configuration,
+resource templates, diagnostic compatibility and remaining production gates.
+The older 64 MiB/on-demand defaults below are historical measurements.
+
+## Agent read performance, 2026-09-29
+
+The agent now reuses verified HTTPS GET connections, coalesces small immutable
+packs into one GET, and retains validated compressed packs in a bounded 64 MiB /
+256-entry LRU. Real staging HK/US samples remain byte-identical; warm queries
+issue zero HTTP requests. Cold queries can still exceed the Cloud shadow deadline.
+See `deploy/README.md` for limits, diagnostic switches, numeric timing metrics and
+freshness boundaries. This does not enable client cache-serving or deploy images.
+
+## Agent and shadow hardening, 2026-09-28
+
+Follow-up: the agent now requires explicit UDS protocol v1 with UTC-instant
+milliseconds and half-open ranges. US legacy ET-wall packs are translated using
+read-only IANA New York TZif transitions; returned rows and their SHA-256 are UTC.
+Cloud verifies the protocol, hash, row times and OHLCV. Old unversioned clients
+are rejected; upgrade the pair together. Runtime `tzdata` is required; ambiguous,
+nonexistent or out-of-transition-range US times fail closed. See the parent
+`docs/R2-AGENT-UTC-CONTRACT-20260928.md` for 74/74 core, 4/4 Gateway and 14-vector
+offline cross-component evidence. Upcloud/SDK US time semantics still need work;
+this is not live upstream parity or full-hit deployment acceptance.
+
+`history-cache-agent` is a long-running, read-only UDS service. Each query now
+owns fresh S3 stores and one aggregate deadline/request/download budget, rather
+than reusing a store whose original 30-second deadline has expired. Local budget,
+deadline, DNS, connect and TLS failures are distinguished. Bounded read retries
+do not change the conditional publisher's write/recovery contract.
+
+The service binds each pack to its source namespace, caches owning immutable
+snapshots, and bounds rows, frame sizes, workers, pending connections and cache
+entries. A complete empty range is a HIT; read errors are not coverage MISSes.
+The companion Cloud gateway uses an asynchronous, bounded shadow queue after
+authentication, market authorization and history admission. It still returns
+all real responses from upstream; full-hit routing is not implemented.
+
+Local validation: Debug curl-OFF CTest **74/74**, including 101 queries with a
+61-second idle interval, cross-month synthetic reads, concurrent TTL refresh and
+UDS lifecycle checks. The related Gateway suite passed **4/4**. Targeted agent
+and transport tests passed **4/4** with curl ON and **4/4** with ASan+UBSan; these
+are not full sanitizer acceptance or real R2/network tests. No deployment or push
+was performed for this change.
+
+Still open: futures trading-day/month routing and multi-partition proofs, US
+wall-clock/UTC semantics, exporter/batch regressions, upstream result comparison,
+full-hit/SDK integration and production deployment gates. A synthetic cross-month
+test does not establish compatible source versions across real DDB partitions.
+See `docs/R2-AGENT-HARDENING-20260928.md` in the parent integration workspace.
+The dated sections below describe earlier milestones, not current acceptance.
 
 ## Native-version snapshot catalog, 2026-09-22
 
@@ -107,9 +230,10 @@ observed evidence; no cleanup retry is authorized by that run's unused budget.
 Not validated: the full synthetic staging profile, real network fault behavior,
 automatic retention/cleanup, or power-loss filesystem behavior. The separate real
 single-chunk publication/read path above passed without deletes.
-Not implemented: multi-partition batch coverage/version proof, minute delta,
-distributed fencing, automatic freshness invalidation, UDS, Cloud routing,
-SDK invalidation, GC, deployment.
+Remaining production work: multi-partition batch coverage/version proof,
+distributed fencing, automatic freshness invalidation, Cloud full-hit routing,
+SDK invalidation, GC and deployment acceptance. UDS and shadow now exist; the
+integration's intraday tools are not wired into the daemon query path.
 The local store is a test double, not a statement about R2 conditional-write
 semantics or cross-object transactions. A source version in a fixture is not a
 verified database commit watermark.

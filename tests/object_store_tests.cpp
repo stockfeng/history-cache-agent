@@ -1,5 +1,7 @@
 #include "history_cache/publisher.h"
 #include "history_cache/reader.h"
+#include "history_cache/factor_publisher.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -264,6 +266,96 @@ void object_store() {
 }
 
 void conditional_publish() {
+    run_case("reuse_immutable_requires_full_get_and_never_puts_on_transport_error", [] {
+        MemoryStore store;
+        const auto content = bytes("immutable fixture");
+        const auto key = "manifests/v1/" + hc::hex(hc::sha256(content)) + ".json";
+        check(hc::reuse_or_put_immutable(store, key, content) == hc::WriteOutcome::applied, "initial reusable put failed");
+        check(store.creates == 1, "initial reusable create count");
+        check(hc::reuse_or_put_immutable(store, key, content) == hc::WriteOutcome::applied && store.creates == 1,
+              "unchanged object reuploaded");
+        store.fail_object_reads = 1;
+        rejects(hc::ErrorCode::io, [&] { (void)hc::reuse_or_put_immutable(store, key, content); });
+        check(store.creates == 1, "network failure became write permission");
+        store.objects[key] = std::make_shared<const hc::Bytes>(bytes("bad"));
+        rejects(hc::ErrorCode::corrupt, [&] { (void)hc::reuse_or_put_immutable(store, key, content); });
+        check(store.creates == 1, "corrupt immutable overwritten");
+    });
+    run_case("reference_factors_require_data_and_refresh_without_data_put", [] {
+        using Json = nlohmann::json;
+        Json data = {{"schema_version", 2}, {"kind", "ddb-adjustment-data-v2"},
+            {"algorithm", "upcloud-adjustment-v1"}, {"symbol", "AAPL"}, {"market", "US"},
+            {"model", "futu_ab"}, {"first_day", 1}, {"end_day", 100}, {"coverage_complete", true},
+            {"allow_empty", true}, {"source_epoch", "factor-fixture"},
+            {"date_encoding", "exchange-civil-days-since-1970"}, {"rows", Json::array()}};
+        const auto payload = bytes(data.dump());
+        const auto key = "manifests/v1/" + hc::hex(hc::sha256(payload)) + ".json";
+        Json ref = data;
+        ref.erase("rows"); ref["kind"] = "ddb-adjustment-reference-v2";
+        ref["observed_at_ms"] = 1000; ref["valid_until_ms"] = 2000;
+        ref["source_proof_sha256"] = hc::hex(hc::sha256("proof"));
+        ref["factor_data_sha256"] = hc::hex(hc::sha256(payload)); ref["factor_data_bytes"] = payload.size();
+        MemoryStore store;
+        int64_t now = 1500;
+        auto publish = [&](const std::optional<hc::Pointer>& base, bool recover = false) {
+            return hc::publish_factors(store, bytes(ref.dump()), "AAPL", "US", base, [&] { return now; }, recover);
+        };
+        rejects(hc::ErrorCode::missing, [&] { (void)publish({}); });
+        check(store.pointer_writes == 0, "unresolved data became visible");
+        check(hc::reuse_or_put_immutable(store, key, payload) == hc::WriteOutcome::applied, "data upload failed");
+        store.pointer_fault = Fault::lost_ack;
+        const auto initial = publish({});
+        check(initial.outcome == hc::PublishOutcome::committed, "reference lost ACK recovery failed");
+        const auto creates = store.creates;
+        ref["observed_at_ms"] = 1400; ref["valid_until_ms"] = 2400;
+        check(hc::reuse_or_put_immutable(store, key, payload) == hc::WriteOutcome::applied && store.creates == creates,
+              "reference refresh reuploaded data");
+        const auto next = publish(initial.target);
+        check(next.outcome == hc::PublishOutcome::committed && store.creates == creates + 1, "refresh manifest count");
+        now = 2500;
+        check(publish(initial.target, true).recovered, "expired reference ACK could not recover");
+        ref["valid_until_ms"] = 2600;
+        check(publish(next.target, true).outcome == hc::PublishOutcome::indeterminate,
+              "unknown reference recovery minted freshness");
+    });
+    run_case("factor_publication_cas_recovery_expiry_and_coverage", [] {
+        using Json = nlohmann::json;
+        Json document = {{"schema_version", 1}, {"kind", "ddb-adjustment-snapshot-v1"},
+            {"algorithm", "upcloud-adjustment-v1"}, {"symbol", "000001.SZ"}, {"market", "SZ"},
+            {"model", "cumulative"}, {"first_day", 1}, {"end_day", 100}, {"coverage_complete", true},
+            {"allow_empty", true}, {"observed_at_ms", 1000}, {"valid_until_ms", 2000},
+            {"source_epoch", "factor-fixture"}, {"source_proof_sha256", hc::hex(hc::sha256("proof"))},
+            {"date_encoding", "exchange-civil-days-since-1970"}, {"rows", Json::array()}};
+        MemoryStore store;
+        int64_t now = 1500;
+        auto publish = [&](const std::optional<hc::Pointer>& base) {
+            return hc::publish_factors(store, bytes(document.dump()), "000001.SZ", "SZ", base, [&] { return now; });
+        };
+        store.pointer_fault = Fault::lost_ack;
+        const auto initial = publish(std::nullopt);
+        check(initial.outcome == hc::PublishOutcome::committed && initial.recovered, "factor lost ack not recovered");
+        const auto writes = store.pointer_writes;
+        check(publish(std::nullopt).recovered && store.pointer_writes == writes, "factor retry wrote twice");
+        store.pointer_fault = Fault::none;
+        now = 2500;
+        document["observed_at_ms"] = 2400; document["valid_until_ms"] = 3400;
+        check(publish(std::nullopt).outcome == hc::PublishOutcome::conflict, "factor stale base accepted");
+        document["end_day"] = 90;
+        rejects(hc::ErrorCode::conflict, [&] { (void)publish(initial.target); });
+        document["end_day"] = 100;
+        const auto next = publish(initial.target);
+        check(next.outcome == hc::PublishOutcome::committed && next.target.publication_seq == 2,
+              "expired factor snapshot could not be renewed");
+        document["observed_at_ms"] = 2600; document["valid_until_ms"] = 3600;
+        now = 2700;
+        store.pointer_fault = Fault::unknown_without_write;
+        check(publish(next.target).outcome == hc::PublishOutcome::indeterminate, "unknown factor write became failure");
+        store.pointer_fault = Fault::none;
+        const auto creates = store.creates;
+        now = 3600;
+        rejects(hc::ErrorCode::corrupt, [&] { (void)publish(next.target); });
+        check(store.creates == creates, "expired candidate uploaded");
+    });
     run_case("create_only_then_exact_etag_cas_and_idempotent_replay", [] {
         MemoryStore store;
         hc::ConditionalPublisher publisher(store);

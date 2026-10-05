@@ -2,6 +2,7 @@
 
 #include "binary.h"
 
+#include <algorithm>
 #include <set>
 #include <tuple>
 
@@ -90,7 +91,8 @@ SeriesIdentity identity_from_json(const nlohmann::json& value) {
 }
 
 PackMetadata pack_metadata(const CatalogEntry& entry) {
-    return {series_id(entry.identity), entry.data_version, entry.source_version, entry.coverage, entry.row_count};
+    return {series_id(entry.identity), entry.data_version, entry.source_version, entry.coverage, entry.row_count,
+            static_cast<uint16_t>(entry.identity.dataset == "ddb-history-native64" ? 3 : entry.identity.dataset == "ddb-history-kline48" ? 2 : 1)};
 }
 
 void validate_manifest(const Manifest& manifest) {
@@ -161,6 +163,29 @@ void validate_publication_transition(const Manifest& before, const Manifest& aft
             }
         }
     }
+}
+
+void validate_epoch_replacement(const Manifest& before, const Manifest& after) {
+    validate_manifest(before);
+    validate_manifest(after);
+    detail::require(before.dataset_epoch != after.dataset_epoch,
+                    "epoch replacement requires different epochs", ErrorCode::conflict);
+    const auto& first = before.entries.front();
+    uint64_t floor = 0;
+    for (const auto& old : before.entries) {
+        detail::require(canonical_identity(old.identity) == canonical_identity(first.identity) &&
+                        old.data_version == first.data_version, "mixed migration source", ErrorCode::conflict);
+        floor = std::max(floor, old.source_version);
+        const auto found = std::find_if(after.entries.begin(), after.entries.end(), [&](const auto& entry) {
+            return entry.coverage.start_ms == old.coverage.start_ms && entry.coverage.end_ms == old.coverage.end_ms;
+        });
+        detail::require(found != after.entries.end() && found->row_count >= old.row_count,
+                        "epoch replacement loses published coverage or rows", ErrorCode::conflict);
+    }
+    for (const auto& entry : after.entries)
+        detail::require(canonical_identity(entry.identity) == canonical_identity(first.identity) &&
+                        entry.data_version == first.data_version && entry.source_version > floor,
+                        "epoch replacement changed semantics or regressed source", ErrorCode::conflict);
 }
 
 std::string serialize_manifest(const Manifest& manifest) {

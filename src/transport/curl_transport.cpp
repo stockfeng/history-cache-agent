@@ -1,6 +1,7 @@
 #include "history_cache/http.h"
 
 #include "binary.h"
+#include <mutex>
 
 #ifdef HC_HAS_CURL
 #include <curl/curl.h>
@@ -65,6 +66,22 @@ struct Headers {
 }  // namespace
 #endif
 
+struct CurlHttpTransport::Pool {
+#ifdef HC_HAS_CURL
+    std::mutex mutex;
+    std::vector<CURL*> idle;
+    size_t active = 0;
+    Pool() { idle.reserve(4); }
+    ~Pool() { for (auto* handle : idle) curl_easy_cleanup(handle); }
+#endif
+};
+
+CurlHttpTransport::CurlHttpTransport(bool enabled, bool reuse)
+    : CurlHttpTransport(enabled, reuse ? Reuse::reads : Reuse::disabled) {}
+CurlHttpTransport::CurlHttpTransport(bool enabled, Reuse reuse)
+    : enabled_(enabled), reuse_(reuse), pool_(reuse != Reuse::disabled ? std::make_shared<Pool>() : nullptr) {}
+CurlHttpTransport::~CurlHttpTransport() = default;
+
 std::string CurlHttpTransport::runtime_version() {
 #ifdef HC_HAS_CURL
     const auto* info = curl_version_info(CURLVERSION_NOW);
@@ -94,7 +111,30 @@ HttpResult CurlHttpTransport::perform(const HttpRequest& request) {
         const auto* info = curl_version_info(CURLVERSION_NOW);
         detail::require(info && info->version_num == LIBCURL_VERSION_NUM && (info->features & CURL_VERSION_SSL) &&
                         (info->features & CURL_VERSION_ASYNCHDNS), "matching TLS/async-DNS curl runtime required", ErrorCode::io);
-        std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> handle(curl_easy_init(), curl_easy_cleanup);
+        bool reusable = false;
+        CURL* pooled = nullptr;
+        if (pool_) {
+            std::lock_guard<std::mutex> guard(pool_->mutex);
+            if (pool_->active >= 4) return {HttpDelivery::not_sent, {}, HttpFailure::resource_limit};
+            if (!pool_->idle.empty()) {
+                pooled = pool_->idle.back();
+                pool_->idle.pop_back();
+            }
+            if (!pooled) pooled = curl_easy_init();
+            detail::require(pooled != nullptr, "cannot allocate HTTPS handle", ErrorCode::io);
+            ++pool_->active;
+        }
+        // Reset clears per-request headers/method/callbacks but retains connections.
+        auto release = [&](CURL* value) {
+            if (value) curl_easy_reset(value);
+            if (pool_) {
+                std::lock_guard<std::mutex> guard(pool_->mutex);
+                --pool_->active;
+                if (value && reusable) { pool_->idle.push_back(value); return; }
+            }
+            if (value) curl_easy_cleanup(value);
+        };
+        std::unique_ptr<CURL, decltype(release)> handle(pooled ? pooled : curl_easy_init(), release);
         detail::require(bool(handle), "cannot allocate HTTPS handle", ErrorCode::io);
         Headers headers;
         size_t header_size = 0;
@@ -131,8 +171,10 @@ HttpResult CurlHttpTransport::perform(const HttpRequest& request) {
         option(curl, CURLOPT_SSL_VERIFYHOST, 2L);
         option(curl, CURLOPT_SSLVERSION, static_cast<long>(CURL_SSLVERSION_TLSv1_2));
         option(curl, CURLOPT_HTTP_VERSION, static_cast<long>(CURL_HTTP_VERSION_1_1));
-        option(curl, CURLOPT_FRESH_CONNECT, 1L);
-        option(curl, CURLOPT_FORBID_REUSE, 1L);
+        option(curl, CURLOPT_FRESH_CONNECT, pool_ ? 0L : 1L);
+        option(curl, CURLOPT_FORBID_REUSE, pool_ ? 0L : 1L);
+        option(curl, CURLOPT_MAXCONNECTS, 2L);
+        option(curl, CURLOPT_MAXAGE_CONN, 30L);
         option(curl, CURLOPT_HTTP_CONTENT_DECODING, 0L);
         option(curl, CURLOPT_NOSIGNAL, 1L);
         option(curl, CURLOPT_HTTPHEADER, headers.value);
@@ -141,6 +183,7 @@ HttpResult CurlHttpTransport::perform(const HttpRequest& request) {
         option(curl, CURLOPT_WRITEFUNCTION, receive_body);
         option(curl, CURLOPT_WRITEDATA, &callbacks);
         option(curl, CURLOPT_NOPROGRESS, 0L);
+        option(curl, CURLOPT_MAX_RECV_SPEED_LARGE, static_cast<curl_off_t>(request.receive_bytes_per_second));
         option(curl, CURLOPT_XFERINFOFUNCTION, progress);
         option(curl, CURLOPT_XFERINFODATA, &callbacks);
         if (request.method == HttpMethod::put) {
@@ -160,14 +203,48 @@ HttpResult CurlHttpTransport::perform(const HttpRequest& request) {
         if (stopped(request)) return {HttpDelivery::not_sent, {}};
         dispatched = true;
         const auto code = curl_easy_perform(curl);
-        if (code != CURLE_OK || callbacks.failed || stopped(request)) return {HttpDelivery::indeterminate, {}};
+        HttpResult::Diagnostics diagnostics;
+        diagnostics.curl_code = static_cast<int>(code);
+        long tls = -1;
+        if (curl_easy_getinfo(curl, CURLINFO_SSL_VERIFYRESULT, &tls) == CURLE_OK)
+            diagnostics.tls_verify_result = tls;
+        HttpResult::Timings timings;
+        const auto duration = [&](CURLINFO field) {
+            curl_off_t value = 0;
+            curl_easy_getinfo(curl, field, &value);
+            return value > 0 ? static_cast<uint64_t>(value) : uint64_t{0};
+        };
+        timings.dns_us = duration(CURLINFO_NAMELOOKUP_TIME_T);
+        timings.connect_us = duration(CURLINFO_CONNECT_TIME_T);
+        timings.tls_us = duration(CURLINFO_APPCONNECT_TIME_T);
+        timings.first_byte_us = duration(CURLINFO_STARTTRANSFER_TIME_T);
+        timings.total_us = duration(CURLINFO_TOTAL_TIME_T);
+        long connections = 0;
+        curl_easy_getinfo(curl, CURLINFO_NUM_CONNECTS, &connections);
+        timings.new_connections = connections > 0 ? static_cast<uint64_t>(connections) : 0;
+        if (code != CURLE_OK || callbacks.failed || stopped(request)) {
+            auto failure = HttpFailure::transport;
+            if (request.cancelled && request.cancelled->load()) failure = HttpFailure::cancelled;
+            else if (stopped(request) || code == CURLE_OPERATION_TIMEDOUT) failure = HttpFailure::deadline;
+            else if (code == CURLE_COULDNT_RESOLVE_HOST) failure = HttpFailure::dns;
+            else if (code == CURLE_COULDNT_CONNECT) failure = HttpFailure::connect;
+            else if (code == CURLE_SSL_CONNECT_ERROR || code == CURLE_PEER_FAILED_VERIFICATION ||
+                     code == CURLE_SSL_CACERT_BADFILE) failure = HttpFailure::tls;
+            return {HttpDelivery::indeterminate, {}, failure, timings, diagnostics};
+        }
         auto response = callbacks.buffer.finish();
-        long tls = -1, status = 0;
-        detail::require(curl_easy_getinfo(curl, CURLINFO_SSL_VERIFYRESULT, &tls) == CURLE_OK && tls == 0 &&
+        long status = 0;
+        detail::require(diagnostics.tls_verify_result == 0 &&
                         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status) == CURLE_OK &&
                         status == static_cast<long>(response.status), "unverified HTTPS response", ErrorCode::io);
         response.tls_verified = true;
-        return {HttpDelivery::complete, std::move(response)};
+        reusable = pool_ && request.method == HttpMethod::get && response.status >= 200 && response.status < 300;
+        // Missing-object probes and successful conditional writes are normal in a
+        // publication. Reuse the connection, not the response or write outcome.
+        if (pool_ && reuse_ == Reuse::publication)
+            reusable = reusable || (request.method == HttpMethod::get && response.status == 404) ||
+                       (request.method == HttpMethod::put && response.status == 200);
+        return {HttpDelivery::complete, std::move(response), HttpFailure::none, timings, diagnostics};
     } catch (...) {
         return {dispatched ? HttpDelivery::indeterminate : HttpDelivery::not_sent, {}};
     }

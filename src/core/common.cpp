@@ -157,6 +157,7 @@ void validate_row(const Row& row) {
 }
 
 RowBytes canonical_row(const Row& row) {
+    detail::require(!row.native, "native rows require explicit native encoding", ErrorCode::invalid);
     validate_row(row);
     static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
     RowBytes result{};
@@ -171,7 +172,50 @@ RowBytes canonical_row(const Row& row) {
     return result;
 }
 
-bool same_row(const Row& lhs, const Row& rhs) { return canonical_row(lhs) == canonical_row(rhs); }
+bool same_row(const Row& lhs, const Row& rhs) {
+    if (lhs.native || rhs.native)
+        return lhs.native && rhs.native && canonical_native(lhs) == canonical_native(rhs);
+    return canonical_row(lhs) == canonical_row(rhs) &&
+           detail::bits<uint64_t>(lhs.turnover) == detail::bits<uint64_t>(rhs.turnover) &&
+           lhs.open_interest == rhs.open_interest;
+}
+
+std::array<uint8_t, 48> canonical_kline(const Row& row) {
+    detail::require(std::isfinite(row.turnover) && row.volume >= 0 && row.open_interest >= 0,
+                    "invalid complete kline fields", ErrorCode::invalid);
+    static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559);
+    std::array<uint8_t, 48> result{};
+    const auto base = canonical_row(row);
+    std::copy(base.begin(), base.end(), result.begin());
+    const auto turnover = detail::bits<uint64_t>(row.turnover);
+    const auto interest = static_cast<uint64_t>(row.open_interest);
+    for (size_t i = 0; i < 8; ++i) {
+        result[32 + i] = static_cast<uint8_t>(turnover >> (8 * i));
+        result[40 + i] = static_cast<uint8_t>(interest >> (8 * i));
+    }
+    return result;
+}
+
+std::array<uint8_t, 64> canonical_native(const Row& row) {
+    detail::require(row.native.has_value() && row.timestamp_ms >= 0 && row.volume >= 0 &&
+                    row.native->open_oi >= 0 && row.native->close_oi >= 0,
+                    "invalid DDB native fields", ErrorCode::invalid);
+    std::array<uint8_t, 64> result{};
+    size_t offset = 0;
+    const auto append = [&](uint64_t value) {
+        for (size_t i = 0; i < 8; ++i) result[offset++] = static_cast<uint8_t>(value >> (8 * i));
+    };
+    append(static_cast<uint64_t>(row.timestamp_ms));
+    for (double price : row.native->prices) {
+        detail::require(std::isfinite(price) && price != -std::numeric_limits<double>::max(),
+                        "invalid DDB native price", ErrorCode::invalid);
+        append(detail::bits<uint64_t>(price));
+    }
+    append(static_cast<uint64_t>(row.volume));
+    append(static_cast<uint64_t>(row.native->open_oi));
+    append(static_cast<uint64_t>(row.native->close_oi));
+    return result;
+}
 
 Bytes read_file(const std::filesystem::path& path, uint64_t max_bytes) {
     detail::File file(path, O_RDONLY);

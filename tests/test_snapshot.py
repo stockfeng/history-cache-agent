@@ -4,6 +4,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 import struct
 import subprocess
@@ -26,20 +27,22 @@ def read(path, maximum=1024 * 1024):
     return path.read_bytes()
 
 
-def decode_pack(payload, entry):
+def decode_pack(payload, entry, max_rows=5000):
+    schema = 3 if entry["identity"]["dataset"] == "ddb-history-native64" else 2 if entry["identity"]["dataset"] == "ddb-history-kline48" else 1
+    row_format = struct.Struct("<q4d3q" if schema == 3 else "<q4fqdq" if schema == 2 else "<q4fq")
     descriptor = entry["object"]
     check(len(payload) == descriptor["bytes"] and sha(payload) == descriptor["sha256"]
           and descriptor["key"] == "data/v1/" + sha(payload) + ".r2b", "pack hash or size mismatch")
     check(len(payload) >= 240, "short pack")
     header = payload[:160]
-    check(struct.unpack_from("!4sHHHHI", header) == (b"R2H1", 1, 160, 1, 1, 60), "pack format mismatch")
+    check(struct.unpack_from("!4sHHHHI", header) == (b"R2H1", 1, 160, schema, 1, 60), "pack format mismatch")
     check(header[16:32].hex() == entry["series_id"] == identity_hash(entry["identity"]), "series mismatch")
     check(header[32:64].hex() == entry["data_version"], "data version mismatch")
     version, start, end, first, last, total = struct.unpack_from("!QqqqqQ", header, 64)
     check((version, start, end, total) == (entry["source_version"], entry["coverage_start_ms"],
                                         entry["coverage_end_ms"], entry["rows"]), "pack metadata differs")
     count, toc_size, toc_offset, data_offset, data_bytes = struct.unpack_from("!IIQQQ", header, 112)
-    check(0 < total <= 5000 and count == (total + 1023) // 1024 and
+    check(0 < total <= max_rows <= 500000 and count == (total + 1023) // 1024 and
           (toc_size, toc_offset, data_offset) == (80, 160, 160 + 80 * count)
           and data_offset + data_bytes == len(payload) and header[144:] == bytes(16), "invalid pack bounds")
     check(sha(payload[:data_offset]) == descriptor["index_sha256"], "index hash mismatch")
@@ -55,19 +58,21 @@ def decode_pack(payload, entry):
               0 < size <= 65536 and offset + size <= len(payload), "invalid block bounds")
         frame = payload[offset:offset + size]
         check(hashlib.sha256(frame).digest() == digest, "block checksum mismatch")
-        values = decode_columns(decompress(frame, raw_size))
+        values = decode_columns(decompress(frame, raw_size), schema)
         check(len(values) == rows and (values[0][0], values[-1][0]) == (block_first, block_last), "block rows differ")
         for row in values:
             check(start <= row[0] < end and row[0] > previous and row[-1] >= 0, "invalid decoded row")
+            check(row[5] >= 0 and all(math.isfinite(value) for value in row[1:5])
+                  and (schema == 1 or math.isfinite(row[6])) and (schema != 3 or row[6] >= 0), "invalid decoded fields")
             previous = row[0]
-            decoded.extend(struct.pack("<q4fq", *row))
+            decoded.extend(row_format.pack(*row))
         cursor += size
-    check(len(decoded) == total * 32 and cursor == len(payload)
+    check(len(decoded) == total * row_format.size and cursor == len(payload)
           and (struct.unpack_from("<q", decoded)[0], previous) == (first, last), "pack totals differ")
     return bytes(decoded)
 
 
-def fixture(count):
+def fixture(count, complete=False, native=False):
     start = 1_764_518_400_000
     mapping = {"host": "192.0.2.10", "port": 8848, "database": "dfs://history", "table": "stock",
                "time_column": "trade_time", "code_column": "code", "timestamp_offset_ms": 28800000}
@@ -112,6 +117,41 @@ def fixture(count):
               "dataset_epoch": "ddb-chunk-" + sha(canonical(origin)), "data_version": sha(canonical(semantics)),
               "row_count": count, "rows_sha256": sha(rows), "raw_rows_sha256": sha(raw),
               "freshness_policy": "explicit-revalidation-required", "guard": {"before": state, "after": copy.deepcopy(state)}}
+    if complete:
+        identity["dataset"] = "ddb-history-kline48"
+        mapping["field_mapping"] = {"turnover": "amount", "open_interest": "open_oi"}
+        source["source"]["field_mapping"] = mapping["field_mapping"]
+        schema["columns"] += [{"name": "amount", "typeString": "DOUBLE"},
+                              {"name": "open_oi", "typeString": "LONG"}]
+        source["guard"]["after"] = copy.deepcopy(state)
+        semantics["query_semantics"] = "upcloud-none-1m-kline48-offset-v1"
+        source.update(query_semantics=semantics["query_semantics"], row_encoding="le-kline48-v1", row_bytes=48,
+                      dataset_epoch="ddb-chunk-" + sha(canonical(origin)), data_version=sha(canonical(semantics)))
+        query = query.replace("volume from", "volume, amount as turnover, open_oi as open_interest from")
+        query += ", turnover asc, open_interest asc"
+        source["source"].update(schema_sha256=sha(canonical(schema)), query_sha256=sha(query.encode()))
+        rows = b"".join(struct.pack("<q4fqdq", *row, 12345.125 + index, 2**53 + index + 1)
+                        for index, row in enumerate(struct.iter_unpack("<q4fq", rows)))
+        raw = b"".join(struct.pack("<q4dqdq", *row, 12345.125 + index, 2**53 + index + 1)
+                       for index, row in enumerate(struct.iter_unpack("<q4dq", raw)))
+        source.update(rows_sha256=sha(rows), raw_rows_sha256=sha(raw))
+    if native:
+        identity["dataset"] = "ddb-history-native64"
+        mapping["field_mapping"] = {"open_oi": "open_oi", "close_oi": "close_oi"}
+        source["source"]["field_mapping"] = mapping["field_mapping"]
+        schema["columns"] += [{"name": "open_oi", "typeString": "LONG"}, {"name": "close_oi", "typeString": "LONG"}]
+        source["guard"]["after"] = copy.deepcopy(state)
+        semantics["query_semantics"] = "ddb-none-1m-native64-offset-v1"
+        source.update(query_semantics=semantics["query_semantics"], row_encoding="le-ddb-native64-v1", row_bytes=64,
+                      dataset_epoch="ddb-chunk-" + sha(canonical(origin)), data_version=sha(canonical(semantics)))
+        query = query.replace("volume from", "volume, open_oi, close_oi from")
+        query += ", open_oi asc, close_oi asc"
+        source["source"].update(schema_sha256=sha(canonical(schema)), query_sha256=sha(query.encode()))
+        rows = b"".join(struct.pack("<q4d3q", row[0] - 28800000, *row[1:], 2**53 + index + 1, 2**53 + index + 7)
+                        for index, row in enumerate(struct.iter_unpack("<q4dq", raw)))
+        raw = b"".join(struct.pack("<q4d3q", *row, 2**53 + index + 1, 2**53 + index + 7)
+                       for index, row in enumerate(struct.iter_unpack("<q4dq", raw)))
+        source.update(rows_sha256=sha(rows), raw_rows_sha256=sha(raw))
     return source, rows
 
 
@@ -121,9 +161,9 @@ def invoke(tool, *args, expected=0):
     return json.loads(result.stdout or result.stderr)
 
 
-def exercise(tool, root, count):
-    source, rows = fixture(count)
-    directory = root / f"rows-{count}"
+def exercise(tool, root, count, complete=False, native=False):
+    source, rows = fixture(count, complete, native)
+    directory = root / f"rows-{count}-{'native' if native else 'full' if complete else 'legacy'}"
     directory.mkdir()
     source_path, rows_path = directory / "source.json", directory / "rows.bin"
     source_path.write_bytes(canonical(source))
@@ -144,18 +184,21 @@ def exercise(tool, root, count):
     first = source["requested_start_ms"] + 34200000
     result = invoke(tool, "local", "--candidate", candidate, "--output", directory / "limited",
                     "--start", first, "--end", source["requested_end_ms"], "--max-count", 3)
-    check(result["rows"] == min(count, 3) and result["rows_sha256"] == sha(rows[:96]), "max_count differs")
+    check(result["rows"] == min(count, 3) and result["rows_sha256"] == sha(rows[:192 if native else 144 if complete else 96]), "max_count differs")
     result = invoke(tool, "local", "--candidate", candidate, "--output", directory / "miss",
                     "--end", source["requested_end_ms"] + 1)
     check(result["result"] == "MISS" and not (directory / "miss" / "rows.bin").exists(), "uncovered range was delivered")
     result = invoke(tool, "plan", "--candidate", candidate, "--account", "a" * 32,
-                    "--bucket", "history-cache-staging", "--run-id", "snapshot-offline")
+                    "--bucket", "history-cache-staging", "--run-id", "snapshot-native64-offline" if native else "snapshot-kline48-offline" if complete else "snapshot-offline")
     check(result["max_requests"] == 48 and len(result["objects"]) == (4 if count else 3), "transfer scope differs")
     result = invoke(tool, "plan", "--candidate", candidate, "--account", "a" * 32,
-                    "--bucket", "history-cache-staging", "--run-id", "snapshot-upgrade",
+                    "--bucket", "history-cache-staging", "--run-id", "snapshot-native64-upgrade" if native else "snapshot-kline48-upgrade" if complete else "snapshot-upgrade",
                     "--expected-seq", "7")
     check(result["expected_seq"] == 7 and result["target"]["publication_seq"] == 8,
           "upgrade publication plan differs")
+    invoke(tool, "plan", "--candidate", candidate, "--account", "a" * 32,
+           "--bucket", "history-cache-staging", "--run-id",
+           "snapshot-legacy" if complete else "snapshot-kline48-wrong", expected=2)
     return source_path, rows_path, source
 
 
@@ -166,6 +209,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="history-cache-snapshot-") as temporary:
         root = Path(temporary)
         for count in (0, 1, 240, 2050, 5000):
+            exercise(args.tool, root, count, native=True)
+            exercise(args.tool, root, count, complete=True)
             source_path, rows_path, source = exercise(args.tool, root, count)
         cases = [lambda s: s.update(coverage_verified=False), lambda s: s.update(production_eligible=True),
                  lambda s: s.update(upstream_finality_proven=True), lambda s: s.update(source_version=8),
@@ -184,6 +229,8 @@ def main():
             invoke(args.tool, "encode", "--source", source_path, "--rows", rows_path,
                    "--output", root / f"bad-{index}", expected=2)
     print("PASS snapshot_cli roundtrip=5 negative_checks=14 network=0")
+    print("PASS snapshot_complete roundtrip=5 fields8 namespace_isolation network=0")
+    print("PASS snapshot_native roundtrip=5 double_ohlc two_oi namespace_isolation network=0")
 
 
 if __name__ == "__main__":

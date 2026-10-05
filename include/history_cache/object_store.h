@@ -54,5 +54,7 @@ public:
 // A successful create or an existing identical object must pass a full read-back.
 // Observing identical bytes does not establish ownership; this API never deletes.
 [[nodiscard]] WriteOutcome put_immutable(ObjectStore& store, const std::string& key, const Bytes& bytes);
+// Skip PUT only after a full byte match. Only authoritative missing permits a write.
+[[nodiscard]] WriteOutcome reuse_or_put_immutable(ObjectStore& store, const std::string& key, const Bytes& bytes);
 
 }  // namespace history_cache

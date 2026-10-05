@@ -25,7 +25,7 @@ COPY tests tests
 COPY CMakeLists.txt .
 
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DHISTORY_CACHE_CURL=ON \
-    && cmake --build build --target history-cache-agent -j"$(nproc)"
+    && cmake --build build --target history-cache-agent -j2
 
 FROM rockylinux:9
 
@@ -34,6 +34,7 @@ RUN dnf install -y --allowerasing --setopt=install_weak_deps=False \
     openssl-libs \
     libcurl \
     libzstd \
+    tzdata \
     && dnf clean all \
     && mkdir -p /run/history-cache
 

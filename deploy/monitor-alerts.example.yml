@@ -1,0 +1,26 @@
+groups:
+  - name: history-cache-operations
+    rules:
+      - alert: HistoryCacheOperationalFault
+        expr: r2_cache_severity >= 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "History cache operational warning; inspect local health.json codes"
+      - alert: HistoryCacheMonitorStale
+        expr: time() - r2_cache_last_check_unixtime > 180
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "History cache monitor stopped updating"
+      - alert: HistoryCacheNotificationFailed
+        expr: r2_cache_notification_failed == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "History cache webhook delivery failed or outcome is unknown"
+# Add absent() rules for the explicitly deployed instance/job labels in your
+# monitoring system. A generic absent() cannot detect one missing fleet member.

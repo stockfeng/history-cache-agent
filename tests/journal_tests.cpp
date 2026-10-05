@@ -1,6 +1,8 @@
 #include "transport_fixture.h"
 #include "history_cache/journal.h"
 #include "history_cache/reader.h"
+#include "history_cache/factor_publisher.h"
+#include <nlohmann/json.hpp>
 
 #include <cerrno>
 #include <fcntl.h>
@@ -48,6 +50,197 @@ hc::Digest tail(const hc::Bytes& event) {
 }
 
 void journal_storage() {
+    run_case("market_source_revision_guard_and_compact_reuse", [] {
+        using Json = nlohmann::json;
+        Workspace workspace;
+        auto peer = std::make_shared<FakeS3>();
+        hc::S3Store store(config(), peer, credentials(), limits(), signing_time);
+        constexpr int64_t day = 20728, now = day * 86400000 + 1000, until = (day + 3) * 86400000;
+        Json data = {{"schema_version", 2}, {"kind", "ddb-adjustment-data-v2"},
+            {"algorithm", "upcloud-adjustment-v1"}, {"symbol", "000001.SZ"}, {"market", "SZ"},
+            {"model", "cumulative"}, {"first_day", 1}, {"end_day", 100}, {"coverage_complete", true},
+            {"allow_empty", true}, {"source_epoch", "factor-fixture"},
+            {"date_encoding", "exchange-civil-days-since-1970"}, {"rows", Json::array()}};
+        const auto payload = bytes(data.dump());
+        check(hc::reuse_or_put_immutable(store, test::key(payload), payload) == hc::WriteOutcome::applied, "data upload failed");
+        Json doc = data;
+        doc.erase("rows");
+        doc.update(Json{{"schema_version", 3}, {"kind", "ddb-adjustment-reference-v3"},
+            {"observed_at_ms", now}, {"valid_until_ms", until}, {"source_proof_sha256", hc::hex(hc::sha256("proof"))},
+            {"factor_data_sha256", hc::hex(hc::sha256(payload))}, {"factor_data_bytes", payload.size()},
+            {"verification", {{"policy", "market-source-check-v1"}, {"exchange", "XSHE"},
+                {"calendar_sha256", hc::hex(hc::sha256("calendar"))}, {"trading_day", day}, {"next_trading_day", day + 3},
+                {"check_minute", 480}, {"source_revision", 2}, {"source_completed_at_ms", now}, {"next_check_ms", until},
+                {"config_sha256", hc::hex(hc::sha256("config"))}, {"workload_sha256", hc::hex(hc::sha256("workload"))},
+                {"source_receipt_sha256", hc::hex(hc::sha256("receipt"))}}}});
+        const auto initial = hc::publish_factors(store, bytes(doc.dump()), "000001.SZ", "SZ", {}, [] { return now; });
+        check(initial.outcome == hc::PublishOutcome::committed, "market initial publish failed");
+        for (int mode = 0; mode < 2; ++mode) {
+            auto bad = doc;
+            if (mode == 0) bad["verification"]["source_revision"] = 1;
+            else bad["verification"]["source_receipt_sha256"] = hc::hex(hc::sha256("tamper"));
+            peer->calls.clear();
+            rejects(hc::ErrorCode::conflict, [&] {
+                (void)hc::publish_factors(store, bytes(bad.dump()), "000001.SZ", "SZ", initial.target, [] { return now; });
+            });
+            check(std::none_of(peer->calls.begin(), peer->calls.end(), [](const auto& call) {
+                return call.method == hc::HttpMethod::put;
+            }), "bad source revision wrote data");
+        }
+        doc["verification"]["source_revision"] = 3;
+        doc["verification"]["source_receipt_sha256"] = hc::hex(hc::sha256("next-receipt"));
+        check(hc::publish_factors(store, bytes(doc.dump()), "000001.SZ", "SZ", initial.target, [] { return now; }).outcome ==
+              hc::PublishOutcome::committed, "fresh source check failed");
+    });
+    run_case("explicit_factor_retry_same_target_no_rebase_or_expired_write", [] {
+        using Json = nlohmann::json;
+        const Json doc = {{"schema_version", 1}, {"kind", "ddb-adjustment-snapshot-v1"},
+            {"algorithm", "upcloud-adjustment-v1"}, {"symbol", "AAPL"}, {"market", "US"},
+            {"model", "futu_ab"}, {"first_day", 1}, {"end_day", 100}, {"coverage_complete", true},
+            {"allow_empty", true}, {"observed_at_ms", 1000}, {"valid_until_ms", 2000},
+            {"source_epoch", "factor-fixture"}, {"source_proof_sha256", hc::hex(hc::sha256("proof"))},
+            {"date_encoding", "exchange-civil-days-since-1970"}, {"rows", Json::array()}};
+        for (int mode = 0; mode < 4; ++mode) {
+            Workspace workspace;
+            auto peer = std::make_shared<FakeS3>();
+            hc::S3Store store(config(), peer, credentials(), limits(), signing_time);
+            const auto path = workspace.root / "factor-retry";
+            const auto candidate = bytes(doc.dump());
+            hc::JournaledPublisher::prepare_factors(path, store.scope_id(), candidate, "AAPL", "US", {}, 1500);
+            const auto intent = hc::read_file(path / "intent.r2j", hc::kMaxMetadataBytes);
+            peer->fault = mode == 1 ? PointerFault::lost_ack_unreadable : PointerFault::unknown;
+            {
+                hc::JournaledPublisher journal(path, store, [] { return 1500; });
+                check(journal.resume().outcome == hc::PublishOutcome::indeterminate, "missing synthetic failure");
+            }
+            if (mode == 3) {
+                auto other = doc; other["observed_at_ms"] = 1100; other["valid_until_ms"] = 2100;
+                const auto competitor = workspace.root / "competitor";
+                hc::JournaledPublisher::prepare_factors(competitor, store.scope_id(), bytes(other.dump()), "AAPL", "US", {}, 1500);
+                hc::JournaledPublisher writer(competitor, store, [] { return 1500; });
+                check(writer.resume().outcome == hc::PublishOutcome::committed, "competitor failed");
+            }
+            const auto calls = peer->calls.size();
+            hc::JournaledPublisher retry(path, store, [mode] { return mode == 2 ? 2000 : 1500; });
+            const auto result = retry.resume({}, true);
+            check(result.outcome == (mode < 2 ? hc::PublishOutcome::committed : hc::PublishOutcome::indeterminate), "retry outcome");
+            if (mode != 0) check(std::none_of(peer->calls.begin() + static_cast<ptrdiff_t>(calls), peer->calls.end(),
+                [](const auto& call) { return call.method == hc::HttpMethod::put; }), "retry rewrote committed, expired or conflicting pointer");
+            check(hc::read_file(path / "intent.r2j", hc::kMaxMetadataBytes) == intent, "retry changed intent");
+        }
+    });
+    run_case("factor_journal_pins_intent_recovers_expired_ack_and_never_rewrites_unknown", [] {
+        using Json = nlohmann::json;
+        const Json base_doc = {{"schema_version", 1}, {"kind", "ddb-adjustment-snapshot-v1"},
+            {"algorithm", "upcloud-adjustment-v1"}, {"symbol", "000001.SZ"}, {"market", "SZ"},
+            {"model", "cumulative"}, {"first_day", 1}, {"end_day", 100}, {"coverage_complete", true},
+            {"allow_empty", true}, {"observed_at_ms", 1000}, {"valid_until_ms", 2000},
+            {"source_epoch", "factor-fixture"}, {"source_proof_sha256", hc::hex(hc::sha256("proof"))},
+            {"date_encoding", "exchange-civil-days-since-1970"}, {"rows", Json::array()}};
+        for (const bool compact : {false, true}) for (const auto fault : {PointerFault::lost_ack_unreadable, PointerFault::unknown}) {
+            Workspace workspace;
+            auto peer = std::make_shared<FakeS3>();
+            hc::S3Store store(config(), peer, credentials(), limits(), signing_time);
+            const auto path = workspace.root / "factor-journal";
+            auto doc = base_doc;
+            if (compact) {
+                auto data = doc;
+                for (const auto* field : {"observed_at_ms", "valid_until_ms", "source_proof_sha256"}) data.erase(field);
+                data["schema_version"] = 2; data["kind"] = "ddb-adjustment-data-v2";
+                const auto payload = bytes(data.dump());
+                check(hc::reuse_or_put_immutable(store, test::key(payload), payload) == hc::WriteOutcome::applied,
+                      "compact journal data prepare failed");
+                doc.erase("rows"); doc["schema_version"] = 2; doc["kind"] = "ddb-adjustment-reference-v2";
+                doc["factor_data_sha256"] = hc::hex(hc::sha256(payload)); doc["factor_data_bytes"] = payload.size();
+            }
+            const auto candidate = bytes(doc.dump());
+            hc::JournaledPublisher::prepare_factors(path, store.scope_id(), candidate, "000001.SZ", "SZ", {}, 1500);
+            const auto original = hc::read_file(path / "intent.r2j", hc::kMaxMetadataBytes);
+            peer->fault = fault;
+            {
+                hc::JournaledPublisher journal(path, store, [] { return 1500; });
+                check(journal.resume().outcome == hc::PublishOutcome::indeterminate && journal.unresolved(), "factor unknown lost");
+            }
+            peer->calls.clear();
+            hc::JournaledPublisher restarted(path, store, [] { return 2500; });
+            const auto result = restarted.resume();
+            check(result.outcome == (fault == PointerFault::unknown ? hc::PublishOutcome::indeterminate : hc::PublishOutcome::committed),
+                  "expired factor ACK recovery incorrect");
+            check(std::all_of(peer->calls.begin(), peer->calls.end(), [](const auto& call) {
+                return call.method == hc::HttpMethod::get;
+            }), "factor recovery performed a PUT");
+            check(hc::read_file(path / "intent.r2j", hc::kMaxMetadataBytes) == original, "factor intent rewritten");
+            if (fault != PointerFault::unknown) {
+                peer->calls.clear();
+                check(restarted.resume().outcome == hc::PublishOutcome::committed && peer->calls.empty(), "committed journal used network");
+            }
+        }
+    });
+    run_case("factor_journal_barriers_scope_and_torn_intent", [] {
+        using Json = nlohmann::json;
+        const Json doc = {{"schema_version", 1}, {"kind", "ddb-adjustment-snapshot-v1"},
+            {"algorithm", "upcloud-adjustment-v1"}, {"symbol", "AAPL"}, {"market", "US"},
+            {"model", "futu_ab"}, {"first_day", 1}, {"end_day", 100}, {"coverage_complete", true},
+            {"allow_empty", true}, {"observed_at_ms", 1000}, {"valid_until_ms", 2000},
+            {"source_epoch", "factor-fixture"}, {"source_proof_sha256", hc::hex(hc::sha256("proof"))},
+            {"date_encoding", "exchange-civil-days-since-1970"}, {"rows", Json::array()}};
+        Workspace workspace;
+        auto peer = std::make_shared<FakeS3>();
+        hc::S3Store store(config(), peer, credentials(), limits(), signing_time);
+        const auto path = workspace.root / "factor-journal";
+        hc::JournaledPublisher::prepare_factors(path, store.scope_id(), bytes(doc.dump()), "AAPL", "US", {}, 1500);
+        {
+            hc::JournaledPublisher journal(path, store, [] { return 1500; });
+            rejects(hc::ErrorCode::io, [&] { (void)journal.resume([](auto step) {
+                if (step == hc::JournalStep::before_dispatch_sync) throw hc::Error(hc::ErrorCode::io, "injected");
+            }); });
+            check(peer->calls.empty(), "factor dispatched before fsync");
+        }
+        auto cfg = config(); cfg.key_prefix = "r2-history-staging/different-002/";
+        hc::S3Store other(cfg, peer, credentials(), limits(), signing_time);
+        rejects(hc::ErrorCode::conflict, [&] { hc::JournaledPublisher journal(path, other); });
+        auto original = hc::read_file(path / "intent.r2j", hc::kMaxMetadataBytes);
+        original.pop_back(); mutate(path / "intent.r2j", original);
+        rejects(hc::ErrorCode::corrupt, [&] { hc::JournaledPublisher journal(path, store); });
+        check(peer->calls.empty(), "invalid factor journal used network");
+    });
+    run_case("epoch_replacement_is_explicit_pinned_and_recoverable", [] {
+        Workspace workspace;
+        auto peer = std::make_shared<FakeS3>();
+        hc::S3Store store(config(), peer, credentials(), limits(), signing_time);
+        check(hc::ConditionalPublisher(store).publish(manifest(), 0).outcome == hc::PublishOutcome::committed, "initial");
+        const auto base = hc::load_snapshot(store).pointer;
+        auto next = manifest(2); next.dataset_epoch = "new-physical-epoch";
+        rejects(hc::ErrorCode::conflict, [&] { (void)hc::ConditionalPublisher(store).publish(next, 1); });
+        auto wrong = base; wrong.manifest_sha256 = hc::sha256("different");
+        wrong.manifest_key = "manifests/v1/" + hc::hex(wrong.manifest_sha256) + ".json";
+        check(hc::ConditionalPublisher(store).publish(next, 1, wrong).outcome == hc::PublishOutcome::conflict, "base hash ignored");
+        const auto path = workspace.root / "epoch-journal";
+        hc::JournaledPublisher::prepare(path, store.scope_id(), next, 1, {}, base);
+        peer->fault = PointerFault::lost_ack_unreadable;
+        {
+            hc::JournaledPublisher journal(path, store);
+            check(journal.epoch_base() && hc::serialize_pointer(*journal.epoch_base()) == hc::serialize_pointer(base), "base lost");
+            check(journal.resume().outcome == hc::PublishOutcome::indeterminate, "unknown lost");
+        }
+        hc::JournaledPublisher reopened(path, store);
+        check(reopened.resume().outcome == hc::PublishOutcome::committed && reopened.target().publication_seq == 2,
+              "same migration could not recover");
+        check(hc::load_snapshot(store).manifest.dataset_epoch == next.dataset_epoch, "migration not applied");
+    });
+    run_case("epoch_replacement_cannot_drop_dates_or_reset_source_versions", [] {
+        const auto old = manifest(7);
+        auto next = manifest(8); next.dataset_epoch = "new-epoch";
+        hc::validate_epoch_replacement(old, next);
+        auto bad = next; bad.entries[0].coverage.end_ms--;
+        rejects(hc::ErrorCode::conflict, [&] { hc::validate_epoch_replacement(old, bad); });
+        bad = next; bad.entries[0].source_version = 7;
+        rejects(hc::ErrorCode::conflict, [&] { hc::validate_epoch_replacement(old, bad); });
+        bad = next; bad.entries[0].data_version = hc::sha256("changed-schema");
+        rejects(hc::ErrorCode::conflict, [&] { hc::validate_epoch_replacement(old, bad); });
+        bad = next; bad.entries[0].identity.symbol = "DIFFERENT";
+        rejects(hc::ErrorCode::conflict, [&] { hc::validate_epoch_replacement(old, bad); });
+    });
     run_case("intent_requires_new_private_directory_and_exact_candidate", [] {
         Workspace workspace;
         auto peer = std::make_shared<FakeS3>();

@@ -2,6 +2,7 @@
 
 #include "history_cache/catalog.h"
 #include "binary.h"
+#include <nlohmann/json.hpp>
 
 #include <ctime>
 #include <mutex>
@@ -12,6 +13,13 @@ namespace {
 
 bool lower_alnum(char ch) {
     return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
+}
+
+bool isolated_scope(const std::string& value) {
+    return value.rfind("isolated-", 0) == 0 && value.size() >= 10 && value.size() <= 49 &&
+        lower_alnum(value[9]) && std::all_of(value.begin(), value.end(), [](char ch) {
+            return lower_alnum(ch) || ch == '-';
+        });
 }
 
 std::string endpoint(const S3Config& config) {
@@ -25,14 +33,28 @@ std::string endpoint(const S3Config& config) {
                         return lower_alnum(ch) || ch == '-';
                     }), "invalid staging bucket", ErrorCode::invalid);
     const auto segments = '-' + bucket + '-';
-    detail::require(segments.find("-staging-") != std::string::npos &&
+    detail::require(config.environment == "staging" || config.environment == "production",
+                    "invalid storage environment", ErrorCode::invalid);
+    if (config.environment == "staging") {
+        detail::require(segments.find("-staging-") != std::string::npos &&
                     segments.find("-prod-") == std::string::npos &&
                     segments.find("-production-") == std::string::npos,
                     "a dedicated staging bucket name is required", ErrorCode::invalid);
-    const std::string prefix = "r2-history-staging/";
+    } else {
+        detail::require(segments.find("-production-") != std::string::npos &&
+                        segments.find("-staging-") == std::string::npos,
+                        "a dedicated production bucket name is required", ErrorCode::invalid);
+    }
+    const std::string prefix = config.environment == "production" ? "r2-history-production/" : "r2-history-staging/";
     detail::require(config.key_prefix.rfind(prefix, 0) == 0 && config.key_prefix.back() == '/',
                     "invalid staging namespace", ErrorCode::invalid);
-    const auto run = config.key_prefix.substr(prefix.size(), config.key_prefix.size() - prefix.size() - 1);
+    auto run = config.key_prefix.substr(prefix.size(), config.key_prefix.size() - prefix.size() - 1);
+    const auto slash = run.find('/');
+    if (slash != std::string::npos) {
+        detail::require(config.environment == "staging" && isolated_scope(run.substr(0, slash)),
+                        "invalid isolated staging scope", ErrorCode::invalid);
+        run = run.substr(slash + 1);
+    }
     detail::require(run.size() >= 3 && run.size() <= 63 && lower_alnum(run.front()) &&
                     std::all_of(run.begin(), run.end(), [](char ch) { return lower_alnum(ch) || ch == '-'; }),
                     "invalid staging run identifier", ErrorCode::invalid);
@@ -57,8 +79,20 @@ const std::string& field(const HttpResponse& response, const char* name) {
 }
 
 void verified(const HttpResult& result, uint64_t success_limit) {
-    detail::require(result.delivery == HttpDelivery::complete && result.response.tls_verified,
-                    "S3 response is not a complete verified TLS exchange", ErrorCode::io);
+    if (result.delivery != HttpDelivery::complete) {
+        switch (result.failure) {
+            case HttpFailure::resource_limit:
+                throw Error(ErrorCode::resource_limit, "S3 operation budget exhausted before dispatch");
+            case HttpFailure::deadline: throw Error(ErrorCode::io, "S3 operation deadline exceeded");
+            case HttpFailure::cancelled: throw Error(ErrorCode::io, "S3 operation cancelled");
+            case HttpFailure::dns: throw Error(ErrorCode::io, "S3 DNS lookup failed");
+            case HttpFailure::connect: throw Error(ErrorCode::io, "S3 connection failed");
+            case HttpFailure::tls: throw Error(ErrorCode::io, "S3 TLS verification or handshake failed");
+            default: throw Error(ErrorCode::io, result.delivery == HttpDelivery::not_sent
+                ? "S3 request was not sent" : "S3 transport exchange did not complete");
+        }
+    }
+    detail::require(result.response.tls_verified, "S3 response TLS was not verified", ErrorCode::io);
     const auto& response = result.response;
     detail::require(response.status >= 200 && response.status <= 599, "invalid S3 response status");
     const auto limit = response.status >= 300 ? 4096 : success_limit;
@@ -134,6 +168,29 @@ WriteOutcome write_result(const HttpResult& result) {
 
 }  // namespace
 
+S3Config load_storage_profile(const std::string& path, const std::string& role) {
+    const auto bytes = read_file(path, 4096);
+    const auto value = nlohmann::json::parse(bytes);
+    detail::require(value.is_object() && value.size() == 7 && value.at("version").is_number_integer() &&
+                    value.at("version") == 1 &&
+                    value.at("role") == role && (role == "publisher" || role == "reader"),
+                    "invalid storage profile schema or role", ErrorCode::invalid);
+    S3Config config{value.at("account_id").get<std::string>(), value.at("bucket").get<std::string>(),
+                    value.at("prefix").get<std::string>(), value.at("jurisdiction").get<std::string>(),
+                    value.at("environment").get<std::string>(), role == "reader"};
+    const auto root = config.environment == "production" ? "r2-history-production/" : "r2-history-staging/";
+    const std::string root_text(root);
+    const bool isolated = config.environment == "staging" && config.key_prefix.rfind(root_text, 0) == 0 &&
+        config.key_prefix.back() == '/' && isolated_scope(config.key_prefix.substr(root_text.size(),
+            config.key_prefix.size() - root_text.size() - 1));
+    detail::require(config.key_prefix == root || isolated,
+                    "storage profile must name the canonical root or isolated staging scope", ErrorCode::invalid);
+    auto probe = config;
+    probe.key_prefix += "profile-validation/";
+    (void)endpoint(probe);
+    return config;
+}
+
 struct S3Store::State {
     S3Config config;
     std::string host;
@@ -149,7 +206,8 @@ struct S3Store::State {
         HttpRequest request;
         try {
             const auto now = SteadyClock::now();
-            if (limits.cancelled->load() || now >= limits.deadline) return {HttpDelivery::not_sent, {}};
+            if (limits.cancelled->load()) return {HttpDelivery::not_sent, {}, HttpFailure::cancelled};
+            if (now >= limits.deadline) return {HttpDelivery::not_sent, {}, HttpFailure::deadline};
             request.method = method;
             const auto path = '/' + config.bucket + '/' + config.key_prefix + key;
             request.url = "https://" + host + path;
@@ -165,10 +223,11 @@ struct S3Store::State {
             sign_s3_request(request, *credentials, host, path, signing_time());
             const auto reserved = std::max<uint64_t>(response_limit, 4096);
             std::lock_guard<std::mutex> guard(mutex);
-            if (limits.cancelled->load() || SteadyClock::now() >= request.deadline ||
-                used.requests >= limits.max_requests || body.size() > limits.max_upload_bytes - used.upload_reserved ||
+            if (limits.cancelled->load()) return {HttpDelivery::not_sent, {}, HttpFailure::cancelled};
+            if (SteadyClock::now() >= request.deadline) return {HttpDelivery::not_sent, {}, HttpFailure::deadline};
+            if (used.requests >= limits.max_requests || body.size() > limits.max_upload_bytes - used.upload_reserved ||
                 reserved > limits.max_download_bytes - used.download_reserved)
-                return {HttpDelivery::not_sent, {}};
+                return {HttpDelivery::not_sent, {}, HttpFailure::resource_limit};
             ++used.requests;
             used.upload_reserved += body.size();
             used.download_reserved += reserved;
@@ -180,7 +239,8 @@ struct S3Store::State {
             auto result = transport->perform(request);
             if (result.delivery != HttpDelivery::not_sent &&
                 (limits.cancelled->load() || SteadyClock::now() >= request.deadline))
-                return {HttpDelivery::indeterminate, {}};
+                return {HttpDelivery::indeterminate, {}, limits.cancelled->load()
+                    ? HttpFailure::cancelled : HttpFailure::deadline};
             return result;
         }
         catch (...) { return {HttpDelivery::indeterminate, {}}; }
@@ -269,6 +329,7 @@ std::optional<VersionedObject> S3Store::read_current() const {
 }
 
 WriteOutcome S3Store::create(const std::string& key, const Bytes& bytes) {
+    detail::require(!state_->config.read_only, "read-only storage scope", ErrorCode::invalid);
     const auto reference = parse_immutable_key(key);
     detail::require(!bytes.empty() && bytes.size() <= reference.max_bytes, "invalid S3 upload size", ErrorCode::resource_limit);
     detail::require(sha256(bytes) == reference.sha256, "S3 key/content mismatch", ErrorCode::invalid);
@@ -276,6 +337,7 @@ WriteOutcome S3Store::create(const std::string& key, const Bytes& bytes) {
 }
 
 WriteOutcome S3Store::write_current(const Bytes& bytes, const std::optional<std::string>& expected_etag) {
+    detail::require(!state_->config.read_only, "read-only storage scope", ErrorCode::invalid);
     detail::require(!bytes.empty() && bytes.size() <= kMaxPointerBytes, "invalid pointer upload size", ErrorCode::resource_limit);
     (void)parse_pointer(std::string(bytes.begin(), bytes.end()));
     if (expected_etag) validate_etag(*expected_etag);
@@ -284,6 +346,8 @@ WriteOutcome S3Store::write_current(const Bytes& bytes, const std::optional<std:
 }
 
 WriteOutcome S3Store::erase_staging_object(const std::string& key, const std::string& expected_etag) {
+    detail::require(state_->config.environment == "staging" && !state_->config.read_only,
+                    "deletion forbidden outside writable staging", ErrorCode::invalid);
     if (key != "current.json") (void)parse_immutable_key(key);
     validate_etag(expected_etag);
     const auto result = state_->request(HttpMethod::erase, key, {}, 0, {{"if-match", expected_etag}});

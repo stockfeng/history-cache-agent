@@ -28,7 +28,12 @@ struct S3Config {
     std::string bucket;
     std::string key_prefix;
     std::string jurisdiction = "default";
+    std::string environment = "staging";
+    bool read_only = false;
 };
+
+// Non-secret, explicit scope. A profile cannot grant cloud-side permissions.
+S3Config load_storage_profile(const std::string& path, const std::string& role);
 
 struct TransferLimits {
     SteadyClock::time_point deadline = SteadyClock::now() + std::chrono::seconds(30);
@@ -46,7 +51,7 @@ struct TransferUsage {
     uint64_t download_reserved = 0;
 };
 
-// Bound to a dedicated staging namespace and to one finite operation budget.
+// Bound to an explicit namespace and to one finite operation budget.
 class S3Store final : public ObjectStore {
 public:
     S3Store(S3Config config, std::shared_ptr<HttpTransport> transport,

@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -38,6 +39,14 @@ struct Row {
     float low = 0;
     float close = 0;
     int64_t volume = 0;
+    double turnover = 0;
+    int64_t open_interest = 0;
+    struct NativeFields {
+        std::array<double, 4> prices{};
+        int64_t open_oi = 0;
+        int64_t close_oi = 0;
+    };
+    std::optional<NativeFields> native = std::nullopt;
 };
 
 struct Coverage {
@@ -84,6 +93,8 @@ std::string canonical_identity(const SeriesIdentity& identity);
 SeriesId series_id(const SeriesIdentity& identity);
 void validate_row(const Row& row);
 RowBytes canonical_row(const Row& row);
+std::array<uint8_t, 48> canonical_kline(const Row& row);
+std::array<uint8_t, 64> canonical_native(const Row& row);
 bool same_row(const Row& lhs, const Row& rhs);
 Bytes read_file(const std::filesystem::path& path, uint64_t max_bytes);
 void create_new_directory(const std::filesystem::path& path);

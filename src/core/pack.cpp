@@ -9,6 +9,7 @@ namespace history_cache {
 namespace {
 
 void validate_metadata(const PackMetadata& metadata) {
+    detail::require(metadata.row_schema >= 1 && metadata.row_schema <= 3, "unsupported row schema");
     validate_coverage(metadata.coverage);
     detail::require(metadata.source_version > 0 && metadata.data_version != Digest{} &&
                     metadata.series != SeriesId{}, "pack identity/version is missing", ErrorCode::invalid);
@@ -40,11 +41,14 @@ PackDescriptor write_pack(const std::filesystem::path& path,
     for (uint32_t seq = 0; seq < block_count; ++seq) {
         const auto count = static_cast<uint32_t>(std::min<uint64_t>(kBlockRows, metadata.row_count - emitted));
         auto rows = provider(emitted, count);
+        if (metadata.row_schema == 1) for (const auto& row : rows)
+            detail::require(row.turnover == 0 && row.open_interest == 0,
+                            "legacy pack cannot discard complete kline fields", ErrorCode::invalid);
         detail::require(rows.size() == count, "row provider returned an incomplete block", ErrorCode::invalid);
         detail::require(rows.front().timestamp_ms >= metadata.coverage.start_ms &&
                         rows.front().timestamp_ms > last_ms && rows.back().timestamp_ms < metadata.coverage.end_ms,
                         "pack rows are outside coverage or not increasing", ErrorCode::invalid);
-        auto raw = encode_columns(rows);
+        auto raw = encode_columns(rows, metadata.row_schema);
         auto compressed = compress_block(raw);
         detail::require(compressed.size() <= kMaxObjectBytes - offset,
                         "pack exceeds object budget", ErrorCode::resource_limit);
@@ -67,7 +71,7 @@ PackDescriptor write_pack(const std::filesystem::path& path,
     index[0] = 'R'; index[1] = '2'; index[2] = 'H'; index[3] = '1';
     detail::put_be(index, 4, 1, 2);
     detail::put_be(index, 6, kPackHeaderBytes, 2);
-    detail::put_be(index, 8, 1, 2);
+    detail::put_be(index, 8, metadata.row_schema, 2);
     detail::put_be(index, 10, 1, 2);
     detail::put_be(index, 12, 60, 4);
     std::copy(metadata.series.begin(), metadata.series.end(), index.begin() + 16);
@@ -101,7 +105,7 @@ PackIndex read_pack_index(const RangeReader& read, const PackDescriptor& descrip
                     "invalid object size");
     const auto header = exact_read(read, 0, kPackHeaderBytes);
     detail::require(detail::be(header, 0, 4) == 0x52324831 && detail::be(header, 4, 2) == 1 &&
-                    detail::be(header, 6, 2) == kPackHeaderBytes && detail::be(header, 8, 2) == 1 &&
+                    detail::be(header, 6, 2) == kPackHeaderBytes && detail::be(header, 8, 2) == expected.row_schema &&
                     detail::be(header, 10, 2) == 1 && detail::be(header, 12, 4) == 60,
                     "unsupported pack header");
     detail::require(detail::fixed<16>(header, 16) == expected.series &&
@@ -135,6 +139,7 @@ PackIndex read_pack_index(const RangeReader& read, const PackDescriptor& descrip
         const uint64_t last = detail::be(toc, pos + 16, 8);
         detail::require(first <= INT64_MAX && last <= INT64_MAX, "TOC timestamp overflow");
         BlockIndex block;
+        block.row_schema = expected.row_schema;
         block.rows = static_cast<uint32_t>(detail::be(toc, pos + 4, 4));
         block.first_ms = static_cast<int64_t>(first);
         block.last_ms = static_cast<int64_t>(last);
@@ -147,7 +152,7 @@ PackIndex read_pack_index(const RangeReader& read, const PackDescriptor& descrip
                         block.first_ms >= expected.coverage.start_ms && block.first_ms > last_ms &&
                         block.last_ms >= block.first_ms && block.last_ms < expected.coverage.end_ms &&
                         (block.rows != 1 || block.first_ms == block.last_ms) &&
-                        block.raw_bytes >= 24 + uint64_t(block.rows) * 24 && block.raw_bytes <= kMaxBlockBytes &&
+                        block.raw_bytes >= 24 + uint64_t(block.rows) * (expected.row_schema == 3 ? 56U : expected.row_schema == 2 ? 40U : 24U) && block.raw_bytes <= kMaxBlockBytes &&
                         block.compressed_bytes > 0 && block.compressed_bytes <= kMaxBlockBytes &&
                         block.offset == offset && block.compressed_bytes <= descriptor.bytes - offset &&
                         detail::be(toc, pos + 40, 8) == 0, "invalid TOC entry");
@@ -169,7 +174,7 @@ std::vector<Row> read_pack_block(const RangeReader& read, const BlockIndex& bloc
     const auto compressed = exact_read(read, block.offset, block.compressed_bytes);
     detail::require(sha256(compressed) == block.sha256, "block SHA-256 mismatch");
     const auto raw = decompress_block(compressed, block.raw_bytes);
-    auto rows = decode_columns(raw, block.rows);
+    auto rows = decode_columns(raw, block.rows, block.row_schema);
     detail::require(rows.front().timestamp_ms == block.first_ms && rows.back().timestamp_ms == block.last_ms,
                     "decoded timestamps differ from TOC");
     return rows;

@@ -7,10 +7,9 @@ Wants=network-online.target
 Type=simple
 ExecStart=/opt/history-cache/bin/history-cache-agent \
   --socket /run/history-cache/agent.sock \
-  --account ${R2_ACCOUNT_ID} \
-  --access-key-id ${R2_ACCESS_KEY_ID} \
-  --secret-access-key ${R2_SECRET_ACCESS_KEY}
-EnvironmentFile=/opt/history-cache/etc/r2-agent.env
+  --credentials-file /etc/history-cache/credentials.json \
+  --foreground-network yes \
+  --pack-cache-bytes 33554432
 Restart=always
 RestartSec=5
 RuntimeDirectory=history-cache
@@ -22,6 +21,15 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/run/history-cache
 PrivateTmp=true
+CPUQuota=25%
+CPUWeight=10
+MemoryHigh=96M
+MemoryMax=128M
+MemorySwapMax=0
+TasksMax=32
+LimitNOFILE=256
+Nice=19
+IOSchedulingClass=idle
 
 [Install]
 WantedBy=multi-user.target

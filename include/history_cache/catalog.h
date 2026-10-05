@@ -35,6 +35,8 @@ struct Snapshot {
 
 void validate_manifest(const Manifest& manifest);
 void validate_publication_transition(const Manifest& before, const Manifest& after);
+// Explicit whole-coverage replacement only; ordinary publication still rejects epochs.
+void validate_epoch_replacement(const Manifest& before, const Manifest& after);
 PackMetadata pack_metadata(const CatalogEntry& entry);
 nlohmann::json identity_json(const SeriesIdentity& identity);
 SeriesIdentity identity_from_json(const nlohmann::json& value);

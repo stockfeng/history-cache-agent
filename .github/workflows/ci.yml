@@ -3,6 +3,7 @@ name: offline-core
 on:
   push:
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -10,7 +11,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       matrix:
         sanitizers: ["OFF", "ON"]
@@ -21,11 +22,15 @@ jobs:
       - name: Build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ pkg-config libssl-dev libzstd-dev nlohmann-json3-dev
+          sudo apt-get install -y cmake g++ pkg-config libssl-dev libzstd-dev nlohmann-json3-dev tzdata
       - name: Configure
         run: timeout --kill-after=5s 30s cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DHISTORY_CACHE_CURL=OFF -DHISTORY_CACHE_SANITIZERS=${{ matrix.sanitizers }}
+      - name: Offline deployment regression (no Docker daemon)
+        run: |
+          bash -n docker/deploy-agent.sh
+          timeout --kill-after=5s 60s python3 -B -m unittest discover -s tests -p 'test_deploy*.py'
       - name: Build
-        run: timeout --kill-after=5s 180s cmake --build build --parallel 2
+        run: timeout --kill-after=5s 600s cmake --build build --parallel 2
       - name: Test
         run: |
           timeout --kill-after=5s 300s ctest --test-dir build --output-on-failure --parallel 1 --no-tests=error --output-junit build/ctest.xml

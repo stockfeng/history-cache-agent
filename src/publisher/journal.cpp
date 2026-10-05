@@ -1,4 +1,6 @@
 #include "history_cache/journal.h"
+#include "history_cache/factor_publisher.h"
+#include <nlohmann/json.hpp>
 
 #include "binary.h"
 
@@ -103,7 +105,18 @@ Pointer make_target(const Manifest& candidate, uint64_t expected_seq) {
     return {candidate.dataset_epoch, expected_seq + 1, "manifests/v1/" + hex(hash) + ".json", hash};
 }
 
-Bytes intent(const Digest& scope, const Manifest& candidate, uint64_t expected_seq) {
+Pointer factor_target(const Bytes& bytes, const std::string& symbol, const std::string& market,
+                      const std::optional<Pointer>& base) {
+    const auto parsed = parse_factor_snapshot(bytes, sha256(bytes), symbol, market, 0, false);
+    const auto seq = base ? base->publication_seq : 0;
+    detail::require(seq < UINT64_MAX, "factor sequence exhausted", ErrorCode::resource_limit);
+    const Pointer target{parsed.source_epoch, seq + 1, "manifests/v1/" + hex(sha256(bytes)) + ".json", sha256(bytes)};
+    (void)serialize_pointer(target);
+    return target;
+}
+
+Bytes intent(const Digest& scope, const Manifest& candidate, uint64_t expected_seq,
+             const std::optional<Pointer>& epoch_base) {
     detail::require(scope != Digest{}, "empty journal scope", ErrorCode::invalid);
     (void)make_target(candidate, expected_seq);
     const auto manifest = serialize_manifest(candidate);
@@ -113,6 +126,14 @@ Bytes intent(const Digest& scope, const Manifest& candidate, uint64_t expected_s
     detail::put_be(result, 40, expected_seq, 8);
     detail::put_be(result, 48, manifest.size(), 4);
     result.insert(result.end(), manifest.begin(), manifest.end());
+    if (epoch_base) {
+        detail::require(epoch_base->publication_seq == expected_seq &&
+                        epoch_base->dataset_epoch != candidate.dataset_epoch,
+                        "invalid journal epoch migration base", ErrorCode::conflict);
+        result[7] = '2';
+        const auto pointer = serialize_pointer(*epoch_base);
+        result.insert(result.end(), pointer.begin(), pointer.end());
+    }
     const auto hash = sha256(result);
     result.insert(result.end(), hash.begin(), hash.end());
     return result;
@@ -128,14 +149,21 @@ Bytes dispatch_floor(size_t records, const Digest& tail) {
     return result;
 }
 
+void prepare_bytes(const std::filesystem::path& root, const Bytes& bytes, const JournalHook& hook);
+
 }  // namespace
 
 struct JournaledPublisher::State {
     ObjectStore& store;
     Fd root, writer, events, floor;
     Manifest candidate;
+    Bytes factor_bytes;
+    std::string factor_symbol, factor_market;
+    std::optional<Pointer> factor_base;
+    std::function<int64_t()> now_ms;
     uint64_t expected_seq = 0;
     Pointer target;
+    std::optional<Pointer> epoch_base;
     Digest tail{};
     size_t records = 0;
     bool pending = false;
@@ -143,7 +171,10 @@ struct JournaledPublisher::State {
     bool committed = false;
     bool poisoned = false;
 
-    State(const std::filesystem::path& path, ObjectStore& storage) : store(storage), root(directory(path)) {
+    State(const std::filesystem::path& path, ObjectStore& storage, std::function<int64_t()> clock)
+        : store(storage), root(directory(path)), now_ms(std::move(clock)) {
+        if (!now_ms) now_ms = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count(); };
         private_directory(root.get());
         writer = file(root.get(), "writer.lock", O_RDWR);
         lock(writer.get());
@@ -152,11 +183,15 @@ struct JournaledPublisher::State {
         const auto marker = read(ready.get(), 64);
         detail::require(std::string(marker.begin(), marker.end()) == kReady, "journal is not initialized");
         const auto source = file(root.get(), "intent.r2j", O_RDONLY);
-        auto bytes = read(source.get(), kMaxMetadataBytes + kIntentHeader + 32);
+        auto bytes = read(source.get(), kMaxMetadataBytes + kMaxPointerBytes + kIntentHeader + 32);
+        const std::string magic(bytes.begin(), bytes.begin() + std::min<size_t>(8, bytes.size()));
         detail::require(bytes.size() > kIntentHeader + 32 &&
-                        std::string(bytes.begin(), bytes.begin() + 8) == "R2JI0001", "invalid journal intent header");
+                        (magic == "R2JI0001" || magic == "R2JI0002" || magic == "R2JI0003"), "invalid journal intent header");
         const auto length = detail::be(bytes, 48, 4);
-        detail::require(length <= kMaxMetadataBytes && bytes.size() == kIntentHeader + length + 32,
+        detail::require(length <= kMaxMetadataBytes &&
+                        (magic != "R2JI0002" ? bytes.size() == kIntentHeader + length + 32 :
+                         bytes.size() > kIntentHeader + length + 32 &&
+                         bytes.size() <= kIntentHeader + length + kMaxPointerBytes + 32),
                         "truncated journal intent");
         const auto hash = detail::fixed<32>(bytes, bytes.size() - 32);
         tail = sha256(bytes);
@@ -165,8 +200,27 @@ struct JournaledPublisher::State {
         detail::require(sha256(bytes) == hash, "journal intent checksum mismatch");
         detail::require(detail::fixed<32>(bytes, 8) == store.scope_id(), "journal target scope mismatch", ErrorCode::conflict);
         expected_seq = detail::be(bytes, 40, 8);
-        candidate = parse_manifest(std::string(bytes.begin() + kIntentHeader, bytes.end()));
-        target = make_target(candidate, expected_seq);
+        if (magic == "R2JI0003") {
+            const auto body = nlohmann::json::parse(bytes.begin() + kIntentHeader, bytes.end());
+            detail::require(body.is_object() && body.size() == 4 && body.contains("candidate") &&
+                body.contains("symbol") && body.contains("market") && body.contains("base"), "invalid factor intent");
+            const auto encoded = body.at("candidate").get<std::string>();
+            factor_bytes.assign(encoded.begin(), encoded.end());
+            factor_symbol = body.at("symbol").get<std::string>();
+            factor_market = body.at("market").get<std::string>();
+            if (!body.at("base").is_null()) factor_base = parse_pointer(body.at("base").get<std::string>());
+            detail::require(expected_seq == (factor_base ? factor_base->publication_seq : 0), "factor base sequence differs");
+            target = factor_target(factor_bytes, factor_symbol, factor_market, factor_base);
+        } else {
+            candidate = parse_manifest(std::string(bytes.begin() + kIntentHeader, bytes.begin() + kIntentHeader + length));
+            target = make_target(candidate, expected_seq);
+        }
+        if (magic == "R2JI0002") {
+            epoch_base = parse_pointer(std::string(bytes.begin() + kIntentHeader + length, bytes.end()));
+            detail::require(epoch_base->publication_seq == expected_seq &&
+                            epoch_base->dataset_epoch != candidate.dataset_epoch,
+                            "journal migration base differs", ErrorCode::conflict);
+        }
         events = file(root.get(), "events.r2j", O_RDWR);
         const auto log = read(events.get(), kEventBytes * kMaxEvents);
         detail::require(log.size() % kEventBytes == 0, "journal has a torn event; refusing automatic repair");
@@ -246,8 +300,35 @@ struct JournaledPublisher::State {
 };
 
 void JournaledPublisher::prepare(const std::filesystem::path& root, const Digest& scope,
-                                 const Manifest& candidate, uint64_t expected_seq, const JournalHook& hook) {
-    const auto bytes = intent(scope, candidate, expected_seq);
+                                 const Manifest& candidate, uint64_t expected_seq, const JournalHook& hook,
+                                 const std::optional<Pointer>& epoch_base) {
+    const auto bytes = intent(scope, candidate, expected_seq, epoch_base);
+    prepare_bytes(root, bytes, hook);
+}
+
+void JournaledPublisher::prepare_factors(const std::filesystem::path& root, const Digest& scope,
+    const Bytes& candidate, const std::string& symbol, const std::string& market,
+    const std::optional<Pointer>& base, int64_t now_ms, const JournalHook& hook) {
+    detail::require(scope != Digest{}, "empty journal scope", ErrorCode::invalid);
+    (void)parse_factor_snapshot(candidate, sha256(candidate), symbol, market, now_ms);
+    (void)factor_target(candidate, symbol, market, base);
+    const nlohmann::json body = {{"candidate", std::string(candidate.begin(), candidate.end())},
+        {"symbol", symbol}, {"market", market}, {"base", base ? nlohmann::json(serialize_pointer(*base)) : nlohmann::json(nullptr)}};
+    const auto encoded = body.dump();
+    detail::require(encoded.size() <= kMaxMetadataBytes, "factor intent too large", ErrorCode::resource_limit);
+    Bytes bytes{'R', '2', 'J', 'I', '0', '0', '0', '3'};
+    bytes.insert(bytes.end(), scope.begin(), scope.end());
+    bytes.resize(kIntentHeader);
+    detail::put_be(bytes, 40, base ? base->publication_seq : 0, 8);
+    detail::put_be(bytes, 48, encoded.size(), 4);
+    bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+    const auto hash = sha256(bytes);
+    bytes.insert(bytes.end(), hash.begin(), hash.end());
+    prepare_bytes(root, bytes, hook);
+}
+
+namespace {
+void prepare_bytes(const std::filesystem::path& root, const Bytes& bytes, const JournalHook& hook) {
     const auto path = std::filesystem::absolute(root);
     detail::require(!path.filename().empty() && path.filename() != "." && path.filename() != "..",
                     "a new journal leaf directory is required", ErrorCode::invalid);
@@ -276,15 +357,19 @@ void JournaledPublisher::prepare(const std::filesystem::path& root, const Digest
     dir.sync();
     parent.sync();
 }
+}  // namespace
 
-JournaledPublisher::JournaledPublisher(const std::filesystem::path& root, ObjectStore& store)
-    : state_(std::make_unique<State>(root, store)) {}
+JournaledPublisher::JournaledPublisher(const std::filesystem::path& root, ObjectStore& store,
+                                     std::function<int64_t()> now_ms)
+    : state_(std::make_unique<State>(root, store, std::move(now_ms))) {}
 JournaledPublisher::~JournaledPublisher() = default;
 
 Pointer JournaledPublisher::target() const { return state_->target; }
+std::optional<Pointer> JournaledPublisher::epoch_base() const { return state_->epoch_base; }
 bool JournaledPublisher::unresolved() const { return state_->pending || state_->historical_unknown || state_->poisoned; }
+bool JournaledPublisher::committed() const { return state_->committed; }
 
-PublishResult JournaledPublisher::resume(const JournalHook& hook) {
+PublishResult JournaledPublisher::resume(const JournalHook& hook, bool retry_fresh_factors) {
     auto& state = *state_;
     detail::require(!state.poisoned, "reopen journal after local persistence failure", ErrorCode::io);
     if (state.committed) return {PublishOutcome::committed, state.target, true};
@@ -295,8 +380,16 @@ PublishResult JournaledPublisher::resume(const JournalHook& hook) {
     PublishResult result{PublishOutcome::indeterminate, state.target, false};
     try {
         notify(hook, JournalStep::attempt_durable);
-        result = ConditionalPublisher(state.store).publish(state.candidate, state.expected_seq);
-    } catch (...) {}
+        result = state.factor_bytes.empty()
+            ? ConditionalPublisher(state.store).publish(state.candidate, state.expected_seq, state.epoch_base)
+            : publish_factors(state.store, state.factor_bytes, state.factor_symbol, state.factor_market,
+                              state.factor_base, state.now_ms, prior_unknown && !retry_fresh_factors);
+    } catch (const Error& error) {
+        result.error_code = error.code();
+    } catch (...) {
+        result.error_code = ErrorCode::invalid;
+    }
+    if (result.outcome == PublishOutcome::conflict) result.error_code = ErrorCode::conflict;
     if (prior_unknown && result.outcome != PublishOutcome::committed) result.outcome = PublishOutcome::indeterminate;
     const auto event = result.outcome == PublishOutcome::committed ? Event::committed :
                        result.outcome == PublishOutcome::not_applied ? Event::not_applied :

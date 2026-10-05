@@ -46,11 +46,18 @@ Snapshot load_snapshot(const ObjectStore& store, uint64_t min_publication_seq) {
     return snapshot_from(store, *current);
 }
 
-PublishResult ConditionalPublisher::publish(const Manifest& manifest, uint64_t expected_seq) {
+PublishResult ConditionalPublisher::publish(const Manifest& manifest, uint64_t expected_seq,
+                                            const std::optional<Pointer>& epoch_base) {
     detail::require(expected_seq < UINT64_MAX, "publication sequence exhausted", ErrorCode::resource_limit);
     const auto manifest_text = serialize_manifest(manifest);
     const auto hash = sha256(manifest_text);
     const Pointer target{manifest.dataset_epoch, expected_seq + 1, "manifests/v1/" + hex(hash) + ".json", hash};
+    if (epoch_base) {
+        (void)serialize_pointer(*epoch_base);
+        detail::require(epoch_base->publication_seq == expected_seq &&
+                        epoch_base->dataset_epoch != manifest.dataset_epoch,
+                        "invalid epoch migration base", ErrorCode::conflict);
+    }
     const auto current = read_current(store_);
     if (current && is_target(*current, target)) {
         (void)snapshot_from(store_, *current);
@@ -58,7 +65,10 @@ PublishResult ConditionalPublisher::publish(const Manifest& manifest, uint64_t e
     }
     if ((current ? current->pointer.publication_seq : 0) != expected_seq)
         return {PublishOutcome::conflict, target, false};
-    if (current) validate_publication_transition(snapshot_from(store_, *current).manifest, manifest);
+    if (epoch_base) {
+        if (!current || !is_target(*current, *epoch_base)) return {PublishOutcome::conflict, target, false};
+        validate_epoch_replacement(snapshot_from(store_, *current).manifest, manifest);
+    } else if (current) validate_publication_transition(snapshot_from(store_, *current).manifest, manifest);
 
     for (const auto& entry : manifest.entries) {
         if (entry.pack) {

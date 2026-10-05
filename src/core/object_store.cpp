@@ -49,4 +49,17 @@ WriteOutcome put_immutable(ObjectStore& store, const std::string& key, const Byt
     }
 }
 
+WriteOutcome reuse_or_put_immutable(ObjectStore& store, const std::string& key, const Bytes& bytes) {
+    const auto reference = parse_immutable_key(key);
+    detail::require(!bytes.empty() && bytes.size() <= reference.max_bytes && sha256(bytes) == reference.sha256,
+                    "invalid reusable immutable object", ErrorCode::invalid);
+    try {
+        detail::require(store.get(key, bytes.size()) == bytes, "existing immutable differs", ErrorCode::corrupt);
+        return WriteOutcome::applied;
+    } catch (const Error& error) {
+        if (error.code() != ErrorCode::missing) throw;
+    }
+    return put_immutable(store, key, bytes);
+}
+
 }  // namespace history_cache

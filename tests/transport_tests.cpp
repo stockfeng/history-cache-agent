@@ -100,6 +100,60 @@ void sigv4() {
 }
 
 void s3_protocol() {
+    run_case("isolated_staging_profiles_do_not_expand_production_or_allow_nested_paths", [] {
+        Workspace workspace;
+        auto profile = nlohmann::json{{"version", 1}, {"environment", "staging"},
+            {"account_id", std::string(32, 'a')}, {"bucket", "history-cache-staging"},
+            {"prefix", "r2-history-staging/isolated-compact-001/"},
+            {"jurisdiction", "default"}, {"role", "reader"}};
+        const auto path = workspace.root / "isolated.json";
+        hc::write_new_file(path, profile.dump());
+        auto cfg = hc::load_storage_profile(path, "reader");
+        cfg.key_prefix += "factors-aapl-us-v1/";
+        auto peer = std::make_shared<ScriptedHttp>();
+        hc::S3Store reader(cfg, peer, credentials(), limits(), signing_time);
+        auto original = config();
+        original.key_prefix = "r2-history-staging/factors-aapl-us-v1/";
+        hc::S3Store other(original, peer, credentials(), limits(), signing_time);
+        check(reader.scope_id() != other.scope_id(), "isolated scope aliases original");
+        unsigned i = 0;
+        for (const auto& prefix : {"r2-history-staging/isolated-/", "r2-history-staging/isolated-a/b/",
+                "r2-history-staging/isolated-../", "r2-history-staging/other/",
+                "r2-history-production/isolated-a/"}) {
+            profile["prefix"] = prefix;
+            if (std::string(prefix).find("production") != std::string::npos) {
+                profile["environment"] = "production"; profile["bucket"] = "history-cache-production";
+            }
+            const auto invalid = workspace.root / ("invalid-" + std::to_string(i++) + ".json");
+            hc::write_new_file(invalid, profile.dump());
+            rejects(hc::ErrorCode::invalid, [&] { (void)hc::load_storage_profile(invalid, "reader"); });
+        }
+        cfg.key_prefix += "nested/";
+        rejects(hc::ErrorCode::invalid, [&] { hc::S3Store invalid(cfg, peer, credentials()); });
+        check(peer->calls.empty(), "scope validation made network calls");
+    });
+    run_case("production_profile_is_explicit_reader_cannot_write_or_delete", [] {
+        Workspace workspace;
+        const auto path = workspace.root / "storage.json";
+        auto profile = nlohmann::json{{"version", 1}, {"environment", "production"},
+            {"account_id", std::string(32, 'a')}, {"bucket", "history-cache-production"},
+            {"prefix", "r2-history-production/"}, {"jurisdiction", "default"}, {"role", "reader"}};
+        hc::write_new_file(path, profile.dump());
+        auto cfg = hc::load_storage_profile(path, "reader");
+        cfg.key_prefix += "history-test-001/";
+        auto peer = std::make_shared<ScriptedHttp>();
+        hc::S3Store reader(cfg, peer, credentials(), limits(), signing_time);
+        rejects(hc::ErrorCode::invalid, [&] { reader.create(key(bytes("body")), bytes("body")); });
+        rejects(hc::ErrorCode::invalid, [&] { reader.write_current(pointer(), std::nullopt); });
+        rejects(hc::ErrorCode::invalid, [&] { reader.erase_staging_object("current.json", "\"etag\""); });
+        rejects(hc::ErrorCode::invalid, [&] { (void)hc::load_storage_profile(path, "publisher"); });
+        cfg.read_only = false;
+        hc::S3Store writer(cfg, peer, credentials(), limits(), signing_time);
+        rejects(hc::ErrorCode::invalid, [&] { writer.erase_staging_object("current.json", "\"etag\""); });
+        cfg.environment = "staging";
+        rejects(hc::ErrorCode::invalid, [&] { hc::S3Store wrong(cfg, peer, credentials()); });
+        check(peer->calls.empty(), "scope validation performed network I/O");
+    });
     run_case("staging_scope_is_validated_and_credential_independent", [] {
         auto peer = std::make_shared<ScriptedHttp>();
         hc::S3Store one(config(), peer, credentials(), limits(), signing_time);
@@ -250,6 +304,23 @@ void s3_protocol() {
                   "budget/cancellation/expiry was dispatched");
         }
         check(peer->calls.size() == 1, "forbidden dispatch");
+        for (unsigned mode = 0; mode < 3; ++mode) {
+            budget = limits();
+            if (mode == 0) budget.max_requests = 0;
+            if (mode == 1) budget.deadline = hc::SteadyClock::now();
+            if (mode == 2) budget.cancelled->store(true);
+            hc::S3Store limited(config(), peer, credentials(), budget, signing_time);
+            try {
+                limited.read_current();
+                check(false, "limited read succeeded");
+            } catch (const hc::Error& error) {
+                const std::string message = error.what();
+                check(message.find("TLS") == std::string::npos, "local rejection misreported as TLS");
+                check(message.find(mode == 0 ? "budget" : mode == 1 ? "deadline" : "cancelled") != std::string::npos,
+                      "local rejection reason lost");
+            }
+        }
+        check(peer->calls.size() == 1, "limited read reached transport");
     });
     run_case("post_dispatch_cancel_or_bad_response_preserves_uncertainty", [] {
         auto peer = std::make_shared<ScriptedHttp>();
@@ -313,6 +384,10 @@ void curl_offline() {
         request.url = "https://offline.invalid/must-not-resolve";
         request.deadline = hc::SteadyClock::now() + std::chrono::seconds(1);
         check(transport.perform(request).delivery == hc::HttpDelivery::not_sent, "default transport enabled network");
+        hc::CurlHttpTransport pooled(false, true);
+        check(pooled.perform(request).delivery == hc::HttpDelivery::not_sent, "pool bypassed network gate");
+        hc::CurlHttpTransport publisher(false, hc::CurlHttpTransport::Reuse::publication);
+        check(publisher.perform(request).delivery == hc::HttpDelivery::not_sent, "publication pool bypassed network gate");
     });
     run_case("curl_expired_cancelled_or_non_https_never_dispatches", [] {
         hc::CurlHttpTransport transport(true);
@@ -324,6 +399,15 @@ void curl_offline() {
         check(transport.perform(request).delivery == hc::HttpDelivery::not_sent, "cancelled request dispatched");
         request.cancelled->store(false); request.url = "http://offline.invalid/must-not-connect";
         check(transport.perform(request).delivery == hc::HttpDelivery::not_sent, "HTTP permitted");
+        hc::CurlHttpTransport pooled(true, true);
+        check(pooled.perform(request).delivery == hc::HttpDelivery::not_sent, "pool allowed HTTP");
+        request.url = "https://offline.invalid/must-not-connect";
+        request.headers["invalid header"] = "test";
+        for (int i = 0; i < 8; ++i) {
+            const auto result = pooled.perform(request);
+            check(result.delivery == hc::HttpDelivery::not_sent && result.failure != hc::HttpFailure::resource_limit,
+                  "invalid request leaked pool slot");
+        }
     });
     run_case("curl_build_feature_and_runtime_are_reported", [] {
 #ifdef HC_HAS_CURL

@@ -1,356 +1,318 @@
-// Cache agent daemon: serves R2 history packs over a Unix domain socket.
-// Deployed on the cloud gateway machine alongside cloud_gateway_v2.
+#include "history_cache/agent.h"
+#include "history_cache/maintenance.h"
 
-#include "history_cache/catalog.h"
-#include "history_cache/common.h"
-#include "history_cache/pack.h"
-#include "history_cache/s3_store.h"
-
+#include <array>
 #include <atomic>
-#include <chrono>
+#include <cerrno>
+#include <condition_variable>
 #include <csignal>
-#include <cstdio>
 #include <cstring>
+#include <deque>
+#include <fcntl.h>
 #include <iostream>
-#include <iomanip>
-#include <mutex>
-#include <nlohmann/json.hpp>
-#include <optional>
-#include <sstream>
-#include <string>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <thread>
 #include <unistd.h>
-#include <unordered_map>
-#include <vector>
 
 namespace {
-
 namespace hc = history_cache;
 using Json = nlohmann::json;
-
+static_assert(std::atomic_bool::is_always_lock_free);
 std::atomic_bool running{true};
+void handle_signal(int) { running.store(false); }
 
-void handle_signal(int) { running = false; }
-
-struct AgentConfig {
-    std::string socket_path = "/run/history-cache/agent.sock";
-    std::string account_id;
-    std::string bucket = "history-cache-staging";
-    std::string key_prefix = "r2-history-staging/";
-    std::string access_key_id;
-    std::string secret_access_key;
-    uint64_t manifest_ttl_seconds = 300;
-    uint64_t max_rows = 5000;
+struct SocketLock {
+    int fd = -1;
+    ~SocketLock() { if (fd >= 0) close(fd); }
 };
 
-struct CachedSnapshot {
-    hc::Snapshot snapshot;
-    std::chrono::steady_clock::time_point fetched_at;
-};
-
-class Agent {
-public:
-    explicit Agent(const AgentConfig& config)
-        : config_(config),
-          credentials_(std::make_shared<hc::S3Credentials>(
-              config.access_key_id, config.secret_access_key)) {}
-
-    Json handle_query(const Json& request) {
-        const auto symbol = request.value("symbol", "");
-        const auto start_ms = request.value("start_ms", 0LL);
-        const auto end_ms = request.value("end_ms", 0LL);
-        const auto max_rows = request.value("max_rows", static_cast<uint64_t>(config_.max_rows));
-        if (symbol.empty() || start_ms <= 0 || end_ms <= start_ms || max_rows == 0 || max_rows > hc::kMaxRows) {
-            return {{"status", "ERROR"}, {"reason", "invalid_request"}};
-        }
-
-        const auto slug = market_slug(symbol);
-        const auto months = months_of(start_ms, end_ms);
-
-        // Copy entries and keep snapshots alive; pointers into the snapshot
-        // would dangle once the month loop moves to the next iteration.
-        std::vector<hc::CatalogEntry> matches;
-        std::vector<std::string> namespaces;
-        std::vector<std::shared_ptr<const hc::Snapshot>> snapshots;
-        int64_t cursor = start_ms;
-
-        for (const auto& month : months) {
-            const auto namespace_name = "history-" + slug + "-" + month + "-001";
-            const auto snapshot = get_snapshot(namespace_name);
-            if (!snapshot) continue;
-            namespaces.push_back(namespace_name);
-            snapshots.push_back(snapshot);
-            for (const auto& entry : snapshot->manifest.entries) {
-                if (entry.identity.symbol != symbol) continue;
-                if (entry.coverage.end_ms <= cursor || entry.coverage.start_ms >= end_ms) continue;
-                if (entry.coverage.start_ms > cursor) break;
-                matches.push_back(entry);
-                cursor = std::min<int64_t>(end_ms, entry.coverage.end_ms);
-                if (cursor >= end_ms) break;
-            }
-            if (cursor >= end_ms) break;
-        }
-
-        if (cursor < end_ms) {
-            return {{"status", "MISS"},
-                    {"reason", "uncovered_range"},
-                    {"uncovered", Json::array({{cursor, end_ms}})}};
-        }
-
-        // Read rows from matching entries across namespaces.
-        hc::Sha256 hash;
-        std::string data;
-        uint64_t row_count = 0;
-        int64_t first_ms = 0, last_ms = 0;
-        int64_t previous = -1;
-        for (const auto& entry : matches) {
-            if (row_count >= max_rows) break;
-            if (!entry.pack) continue;
-            const auto store = get_store(namespaces.front());
-            if (!store) return {{"status", "ERROR"}, {"reason", "r2_unavailable"}};
-            hc::PackIndex index;
-            hc::RangeReader range;
-            try {
-                range = store->open_range(entry.pack->key, entry.pack->bytes);
-                index = hc::read_pack_index(range, *entry.pack, hc::pack_metadata(entry));
-            } catch (const hc::Error&) {
-                // R2 TLS can be transient; retry once before failing.
-                try {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-                    range = store->open_range(entry.pack->key, entry.pack->bytes);
-                    index = hc::read_pack_index(range, *entry.pack, hc::pack_metadata(entry));
-                } catch (const hc::Error& retry_error) {
-                    return {{"status", "ERROR"},
-                            {"reason", "r2_read_failed"},
-                            {"detail", retry_error.what()}};
-                }
-            }
-            for (const auto& block : index.blocks) {
-                if (row_count >= max_rows) break;
-                if (block.last_ms < start_ms || block.first_ms >= end_ms) continue;
-                const auto rows = hc::read_pack_block(range, block);
-                for (const auto& row : rows) {
-                    if (row.timestamp_ms < start_ms || row.timestamp_ms >= end_ms) continue;
-                    if (row_count >= max_rows) break;
-                    hc::validate_row(row);
-                    if (row.timestamp_ms <= previous) {
-                        return {{"status", "ERROR"}, {"reason", "unordered_rows"}};
-                    }
-                    previous = row.timestamp_ms;
-                    if (row_count == 0) first_ms = row.timestamp_ms;
-                    last_ms = row.timestamp_ms;
-                    hash.update(hc::canonical_row(row));
-                    data.append(reinterpret_cast<const char*>(hc::canonical_row(row).data()),
-                                hc::canonical_row(row).size());
-                    ++row_count;
-                }
-            }
-        }
-
-        if (row_count == 0) {
-            return {{"status", "MISS"}, {"reason", "no_rows_in_range"}};
-        }
-
-        // Hex-encode the row data for JSON transport.
-        static const char* hex_chars = "0123456789abcdef";
-        std::string hex_data;
-        hex_data.reserve(data.size() * 2);
-        for (unsigned char byte : data) {
-            hex_data.push_back(hex_chars[byte >> 4]);
-            hex_data.push_back(hex_chars[byte & 0xf]);
-        }
-
-        return {{"status", "HIT"},
-                {"rows", row_count},
-                {"first_ms", first_ms},
-                {"last_ms", last_ms},
-                {"rows_sha256", hc::hex(hash.finish())},
-                {"data", hex_data},
-                {"sources", namespaces}};
+void load_credentials(const std::string& path, hc::AgentConfig& config) {
+    // Open once, then validate/read the same inode. Never include input in errors.
+    SocketLock file;
+    file.fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    struct stat info{};
+    if (file.fd < 0 || fstat(file.fd, &info) < 0 || !S_ISREG(info.st_mode) ||
+        info.st_uid != geteuid() || info.st_nlink != 1 ||
+        ((info.st_mode & 07777) != 0400 && (info.st_mode & 07777) != 0600))
+        throw std::runtime_error("credentials file must be owned by service uid with mode 0400 or 0600");
+    std::array<char, 4097> data{};
+    size_t size = 0;
+    while (size < data.size()) {
+        const auto n = read(file.fd, data.data() + size, data.size() - size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) throw std::runtime_error("credentials file read failed");
+        if (n == 0) break;
+        size += static_cast<size_t>(n);
     }
-
-private:
-    static std::string market_slug(const std::string& symbol) {
-        std::string text;
-        for (char c : symbol) {
-            if (c != '.') text.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-        }
-        if (symbol.find('.') == std::string::npos) text += "-us";
-        return text;
+    if (size == 0 || size > 4096) throw std::runtime_error("invalid credentials file size");
+    try {
+        const auto value = Json::parse(data.data(), data.data() + size);
+        if (!value.is_object() || value.size() != 3) throw std::runtime_error("schema");
+        const auto account = value.at("account_id").get<std::string>();
+        const auto key = value.at("access_key_id").get<std::string>();
+        const auto secret = value.at("secret_access_key").get<std::string>();
+        const auto printable = [](const std::string& text) {
+            if (text.empty() || text.size() > 1024) return false;
+            for (unsigned char ch : text) if (ch < 33 || ch > 126) return false;
+            return true;
+        };
+        if (account.size() != 32 || account.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos ||
+            !printable(key) || !printable(secret)) throw std::runtime_error("schema");
+        config.account_id = account;
+        config.access_key_id = key;
+        config.secret_access_key = secret;
+    } catch (const std::exception&) {
+        throw std::runtime_error("invalid credentials file schema");
     }
-
-    static std::vector<std::string> months_of(int64_t start_ms, int64_t end_ms) {
-        std::vector<std::string> months;
-        auto time = static_cast<time_t>(start_ms / 1000);
-        std::tm tm{};
-        gmtime_r(&time, &tm);
-        int year = tm.tm_year + 1900, month = tm.tm_mon + 1;
-        while (true) {
-            std::ostringstream stream;
-            stream << std::setfill('0') << std::setw(4) << year
-                   << std::setw(2) << month;
-            months.push_back(stream.str());
-            const auto month_end = static_cast<int64_t>(month_end_ms(year, month));
-            if (month_end >= end_ms) break;
-            ++month;
-            if (month > 12) { month = 1; ++year; }
-        }
-        return months;
-    }
-
-    static int64_t month_end_ms(int year, int month) {
-        std::tm tm{};
-        tm.tm_year = year - 1900;
-        tm.tm_mon = month;  // next month (0-based)
-        tm.tm_mday = 1;
-        return static_cast<int64_t>(timegm(&tm)) * 1000;
-    }
-
-    std::shared_ptr<hc::S3Store> get_store(const std::string& namespace_name) {
-        std::lock_guard<std::mutex> guard(stores_mutex_);
-        auto found = stores_.find(namespace_name);
-        if (found != stores_.end()) return found->second;
-        hc::S3Config s3_config{config_.account_id, config_.bucket, config_.key_prefix + namespace_name + "/"};
-        auto store = std::make_shared<hc::S3Store>(s3_config, transport_, credentials_);
-        stores_[namespace_name] = store;
-        return store;
-    }
-
-    std::shared_ptr<const hc::Snapshot> get_snapshot(const std::string& namespace_name) {
-        const auto now = std::chrono::steady_clock::now();
-        {
-            std::lock_guard<std::mutex> guard(cache_mutex_);
-            auto found = cache_.find(namespace_name);
-            if (found != cache_.end() &&
-                std::chrono::duration_cast<std::chrono::seconds>(now - found->second.fetched_at).count()
-                    < static_cast<int64_t>(config_.manifest_ttl_seconds)) {
-                return std::shared_ptr<const hc::Snapshot>(&found->second.snapshot,
-                    [base = &found->second.snapshot](const hc::Snapshot*) {});
-            }
-        }
-        auto store = get_store(namespace_name);
-        // Retry manifest fetch: R2 TLS can be transient from any network.
-        std::optional<hc::VersionedObject> current;
-        hc::Pointer pointer;
-        hc::Manifest manifest;
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            try {
-                current = store->read_current();
-                if (!current) return nullptr;
-                pointer = hc::parse_pointer(std::string(current->bytes.begin(), current->bytes.end()));
-                auto manifest_bytes = store->get(pointer.manifest_key, hc::kMaxMetadataBytes);
-                manifest = hc::parse_manifest(std::string(manifest_bytes.begin(), manifest_bytes.end()));
-                break;
-            } catch (const hc::Error&) {
-                if (attempt == 2) return nullptr;  // exhausted retries
-                std::this_thread::sleep_for(std::chrono::milliseconds(
-                    500 * (attempt + 1)));  // 500ms, 1000ms backoff
-            }
-        }
-        auto snapshot = std::make_shared<hc::Snapshot>(hc::Snapshot{pointer, std::move(manifest)});
-        {
-            std::lock_guard<std::mutex> guard(cache_mutex_);
-            cache_[namespace_name] = {*snapshot, now};
-        }
-        return snapshot;
-    }
-
-    AgentConfig config_;
-    std::shared_ptr<hc::S3Credentials> credentials_;
-    std::shared_ptr<hc::HttpTransport> transport_ = std::make_shared<hc::CurlHttpTransport>(true);
-    std::mutex cache_mutex_;
-    std::unordered_map<std::string, CachedSnapshot> cache_;
-    std::mutex stores_mutex_;
-    std::unordered_map<std::string, std::shared_ptr<hc::S3Store>> stores_;
-};
-
-void serve_connection(int client_fd, Agent& agent) {
-    std::string buffer;
-    char chunk[65536];
-    while (running) {
-        const auto received = recv(client_fd, chunk, sizeof(chunk), 0);
-        if (received <= 0) break;
-        buffer.append(chunk, static_cast<size_t>(received));
-        size_t newline;
-        while ((newline = buffer.find('\n')) != std::string::npos) {
-            const auto line = buffer.substr(0, newline);
-            buffer.erase(0, newline + 1);
-            if (line.empty()) continue;
-            Json response;
-            try {
-                const auto request = Json::parse(line);
-                const auto op = request.value("op", "");
-                if (op == "query") {
-                    response = agent.handle_query(request);
-                } else if (op == "ping") {
-                    response = {{"status", "PONG"}};
-                } else {
-                    response = {{"status", "ERROR"}, {"reason", "unknown_op"}};
-                }
-            } catch (const std::exception& error) {
-                response = {{"status", "ERROR"}, {"reason", error.what()}};
-            }
-            const auto output = response.dump() + "\n";
-            if (send(client_fd, output.data(), output.size(), MSG_NOSIGNAL) < 0) return;
-        }
-    }
-    close(client_fd);
 }
 
+void serve_connection(int fd, hc::Agent& agent, hc::Maintenance& maintenance) {
+    timeval timeout{2, 0};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) return;
+    std::string buffer;
+    size_t request_limit = 8192;
+    bool framed_composite = false;
+    char chunk[4096];
+    // One bounded request per connection, matching the gateway UDS client.
+    const auto deadline = hc::SteadyClock::now() + std::chrono::seconds(2);
+    while (running && hc::SteadyClock::now() < deadline) {
+        const auto n = recv(fd, chunk, sizeof(chunk), 0);
+        if (n <= 0) return;
+        buffer.append(chunk, static_cast<size_t>(n));
+        // An explicit preamble opts into a bounded large local-only operation.
+        // Ordinary query/control requests keep their original 8 KiB limit.
+        constexpr const char* preamble = "ADJUST64\n";
+        if (!framed_composite && buffer.rfind(preamble, 0) == 0) {
+            framed_composite = true;
+            buffer.erase(0, 9);
+            request_limit = 5000 * 128 + 8192;
+        }
+        if (buffer.size() > request_limit) return;
+        const auto newline = buffer.find('\n');
+        if (newline == std::string::npos) continue;
+        Json response;
+        try {
+            const auto request = Json::parse(buffer.substr(0, newline));
+            const auto op = request.value("op", "");
+            if (framed_composite != (op == "adjust_rows"))
+                response = {{"status", "ERROR"}, {"reason", "invalid_request"}};
+            else if (op == "query" || op == "adjust_rows") response = agent.handle_query(request);
+            else if (op == "ping") response = {{"status", "PONG"}};
+            else if (op == "maintenance_status") response = maintenance.status();
+            else if (op == "maintenance_lease") {
+                const auto& until = request.at("valid_until_mono_ms");
+                if (!until.is_number_integer()) throw std::runtime_error("invalid lease deadline");
+                const auto value = until.get<int64_t>();
+                const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    hc::SteadyClock::now().time_since_epoch()).count();
+                const auto expiry = value > now && value <= now + 2000 ?
+                    hc::SteadyClock::time_point(std::chrono::milliseconds(value)) : hc::SteadyClock::time_point{};
+                response = maintenance.lease(request.at("idle").get<bool>(), expiry);
+            }
+            else response = {{"status", "ERROR"}, {"reason", "unknown_op"}};
+        } catch (const std::exception&) {
+            response = {{"status", "ERROR"}, {"reason", "invalid_request"}};
+        }
+        const auto output = response.dump() + "\n";
+        size_t offset = 0;
+        const auto send_deadline = hc::SteadyClock::now() + std::chrono::seconds(2);
+        while (running && offset < output.size() && hc::SteadyClock::now() < send_deadline) {
+            const auto sent = send(fd, output.data() + offset, output.size() - offset, MSG_NOSIGNAL);
+            if (sent < 0 && errno == EINTR) continue;
+            if (sent <= 0) return;
+            offset += static_cast<size_t>(sent);
+        }
+        return;
+    }
+}
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    AgentConfig config;
-    for (int i = 1; i < argc; ++i) {
-        const std::string arg = argv[i];
-        auto value = [&]() -> std::string {
-            return i + 1 < argc ? argv[++i] : "";
-        };
-        if (arg == "--socket") config.socket_path = value();
-        else if (arg == "--account") config.account_id = value();
-        else if (arg == "--bucket") config.bucket = value();
-        else if (arg == "--prefix") config.key_prefix = value();
-        else if (arg == "--access-key-id") config.access_key_id = value();
-        else if (arg == "--secret-access-key") config.secret_access_key = value();
-        else if (arg == "--max-rows") config.max_rows = std::stoull(value());
-        else {
-            std::cerr << "unknown argument: " << arg << "\n";
-            return 2;
+    hc::AgentConfig config;
+    try {
+        std::string credentials_file;
+        std::string storage_file;
+        bool scope_flags = false;
+        std::string warm_plan;
+        bool file_seen = false;
+        bool inline_credentials = false;
+        bool reuse_connections = true;
+        for (int i = 1; i < argc; ++i) {
+            const std::string arg = argv[i];
+            if (i + 1 >= argc) throw std::runtime_error("missing argument value");
+            const std::string value = argv[++i];
+            if (arg == "--account" || arg == "--access-key-id" || arg == "--secret-access-key")
+                inline_credentials = true;
+            if (arg == "--account" || arg == "--bucket" || arg == "--prefix") scope_flags = true;
+            if (arg == "--socket") config.socket_path = value;
+            else if (arg == "--warm-plan") warm_plan = value;
+            else if (arg == "--foreground-network") {
+                if (value != "yes" && value != "no") throw std::runtime_error("invalid foreground network option");
+                config.foreground_network = value == "yes";
+            }
+            else if (arg == "--adjustment") {
+                if (value != "yes" && value != "no") throw std::runtime_error("invalid adjustment option");
+                config.enable_adjustment = value == "yes";
+            }
+            else if (arg == "--credentials-file") {
+                if (file_seen || value.empty()) throw std::runtime_error("invalid credentials-file option");
+                file_seen = true;
+                credentials_file = value;
+            }
+            else if (arg == "--storage-config") {
+                if (!storage_file.empty() || value.empty()) throw std::runtime_error("duplicate storage config");
+                storage_file = value;
+            }
+            else if (arg == "--account") config.account_id = value;
+            else if (arg == "--bucket") config.bucket = value;
+            else if (arg == "--prefix") config.key_prefix = value;
+            else if (arg == "--access-key-id") config.access_key_id = value;
+            else if (arg == "--secret-access-key") config.secret_access_key = value;
+            else if (arg == "--max-rows") config.max_rows = std::stoull(value);
+            else if (arg == "--reuse-connections") {
+                if (value != "yes" && value != "no") throw std::runtime_error("invalid reuse option");
+                reuse_connections = value == "yes";
+            }
+            else if (arg == "--pack-cache-bytes" || arg == "--full-pack-read-bytes") {
+                if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+                    throw std::runtime_error("invalid pack limit");
+                const auto bytes = std::stoull(value);
+                if (arg == "--pack-cache-bytes") config.max_cached_pack_bytes = bytes;
+                else config.full_pack_read_bytes = bytes;
+            }
+            else if (arg == "--query-timeout-ms") {
+                if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+                    throw std::runtime_error("invalid query timeout");
+                const auto timeout = std::stoull(value);
+                if (timeout == 0 || timeout > 30000) throw std::runtime_error("invalid query timeout");
+                config.query_timeout = std::chrono::milliseconds(timeout);
+            }
+            else throw std::runtime_error("unknown argument");
         }
-    }
-    if (config.account_id.empty() || config.access_key_id.empty() || config.secret_access_key.empty()) {
-        std::cerr << "required: --account, --access-key-id, --secret-access-key\n";
+        if (file_seen) {
+            if (inline_credentials) throw std::runtime_error("credentials-file conflicts with inline credentials");
+            load_credentials(credentials_file, config);
+        }
+        if (!storage_file.empty()) {
+            const auto storage = hc::load_storage_profile(storage_file, "reader");
+            if (scope_flags || !file_seen || config.account_id != storage.account_id)
+                throw std::runtime_error("storage profile conflicts with credentials or command scope");
+            config.bucket = storage.bucket;
+            config.key_prefix = storage.key_prefix;
+            config.jurisdiction = storage.jurisdiction;
+            config.storage_environment = storage.environment;
+        }
+        if (config.account_id.empty() || config.access_key_id.empty() || config.secret_access_key.empty())
+            throw std::runtime_error("required: --account, --access-key-id, --secret-access-key");
+        sockaddr_un address{};
+        if (config.socket_path.empty() || config.socket_path.size() >= sizeof(address.sun_path))
+            throw std::runtime_error("invalid socket path");
+        hc::Agent agent(config, std::make_shared<hc::CurlHttpTransport>(true, reuse_connections));
+        Json plan = Json::array();
+        if (!warm_plan.empty()) {
+            const auto bytes = hc::read_file(warm_plan, 16384);
+            plan = Json::parse(bytes.begin(), bytes.end());
+        }
+        hc::Maintenance maintenance(agent, plan);
+        SocketLock socket_lock;
+        socket_lock.fd = open((config.socket_path + ".lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+        struct stat lock_stat{};
+        if (socket_lock.fd < 0 || fstat(socket_lock.fd, &lock_stat) < 0 || !S_ISREG(lock_stat.st_mode) ||
+            lock_stat.st_uid != geteuid() || lock_stat.st_nlink != 1 ||
+            (lock_stat.st_mode & 0077) || flock(socket_lock.fd, LOCK_EX | LOCK_NB) < 0)
+            throw std::runtime_error("socket ownership lock unavailable");
+        struct stat socket_stat{};
+        if (lstat(config.socket_path.c_str(), &socket_stat) == 0) {
+            if (!S_ISSOCK(socket_stat.st_mode) || socket_stat.st_uid != geteuid())
+                throw std::runtime_error("refusing to remove an unowned socket path");
+            // A legacy server may not use the lock. Refuse any live listener.
+            const int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+            if (probe < 0) throw std::runtime_error("socket probe failed");
+            address.sun_family = AF_UNIX;
+            std::memcpy(address.sun_path, config.socket_path.c_str(), config.socket_path.size() + 1);
+            const int connected = connect(probe, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+            const int saved_errno = errno;
+            close(probe);
+            if (connected == 0 || saved_errno != ECONNREFUSED)
+                throw std::runtime_error("socket already has a listener");
+            if (unlink(config.socket_path.c_str()) < 0) throw std::runtime_error("stale socket cleanup failed");
+        } else if (errno != ENOENT) throw std::runtime_error("socket path inspection failed");
+        std::signal(SIGINT, handle_signal);
+        std::signal(SIGTERM, handle_signal);
+        std::signal(SIGPIPE, SIG_IGN);
+        const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        if (fd < 0) throw std::runtime_error("socket failed");
+        address.sun_family = AF_UNIX;
+        std::memcpy(address.sun_path, config.socket_path.c_str(), config.socket_path.size() + 1);
+        // The ownership lock protects startup, stale recovery and final unlink.
+        if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+            close(fd);
+            throw std::runtime_error("bind failed; check for an existing socket");
+        }
+        if (chmod(config.socket_path.c_str(), 0600) < 0 || listen(fd, 16) < 0) {
+            close(fd);
+            unlink(config.socket_path.c_str());
+            throw std::runtime_error("socket setup failed");
+        }
+        std::mutex mutex;
+        std::condition_variable ready;
+        std::deque<int> pending;
+        bool stopping = false;
+        std::array<int, 2> active{-1, -1};
+        std::vector<std::thread> workers;
+        for (size_t i = 0; i < active.size(); ++i) workers.emplace_back([&, i] {
+            for (;;) {
+                std::unique_lock<std::mutex> lock(mutex);
+                ready.wait(lock, [&] { return stopping || !pending.empty(); });
+                if (stopping) return;
+                const int client = pending.front();
+                pending.pop_front();
+                active[i] = client;
+                lock.unlock();
+                try { serve_connection(client, agent, maintenance); } catch (const std::exception&) {}
+                lock.lock();
+                active[i] = -1;
+                close(client);
+            }
+        });
+        std::thread background;
+        if (!plan.empty()) background = std::thread([&] {
+                while (running) {
+                    maintenance.step();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+            });
+        std::cout << "listening on " << config.socket_path << std::endl;
+        while (running) {
+            maintenance.poll();
+            pollfd event{fd, POLLIN, 0};
+            if (poll(&event, 1, 200) <= 0) continue;
+            const int client = accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
+            if (client < 0) continue;
+            std::lock_guard<std::mutex> lock(mutex);
+            if (pending.size() >= 4) close(client);
+            else { pending.push_back(client); ready.notify_one(); }
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+            for (int client : pending) close(client);
+            for (int client : active) if (client >= 0) shutdown(client, SHUT_RDWR);
+        }
+        ready.notify_all();
+        maintenance.stop();
+        if (background.joinable()) background.join();
+        for (auto& worker : workers) worker.join();
+        close(fd);
+        unlink(config.socket_path.c_str());
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
         return 2;
     }
-
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
-    std::signal(SIGPIPE, SIG_IGN);
-
-    ::unlink(config.socket_path.c_str());
-    const auto fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) { perror("socket"); return 1; }
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    std::strncpy(address.sun_path, config.socket_path.c_str(), sizeof(address.sun_path) - 1);
-    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
-        perror("bind"); return 1;
-    }
-    if (listen(fd, 16) < 0) { perror("listen"); return 1; }
-    std::cout << "listening on " << config.socket_path << "\n";
-
-    Agent agent(config);
-    while (running) {
-        const auto client = accept(fd, nullptr, nullptr);
-        if (client < 0) {
-            if (running) perror("accept");
-            continue;
-        }
-        std::thread(serve_connection, client, std::ref(agent)).detach();
-    }
-    ::unlink(config.socket_path.c_str());
-    close(fd);
-    return 0;
 }

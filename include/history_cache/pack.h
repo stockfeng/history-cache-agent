@@ -22,6 +22,7 @@ struct PackMetadata {
     uint64_t source_version = 0;
     Coverage coverage;
     uint64_t row_count = 0;
+    uint16_t row_schema = 1;
 };
 
 struct BlockIndex {
@@ -32,6 +33,7 @@ struct BlockIndex {
     uint32_t compressed_bytes = 0;
     uint64_t offset = 0;
     Digest sha256{};
+    uint16_t row_schema = 1;
 };
 
 struct PackIndex {

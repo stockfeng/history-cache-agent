@@ -94,7 +94,9 @@ ReadSummary read_plan(const ObjectReader& store, const Plan& plan,
                 previous = row.timestamp_ms;
                 if (summary.rows == 0) summary.first_ms = row.timestamp_ms;
                 summary.last_ms = row.timestamp_ms;
-                hash.update(canonical_row(row));
+                if (plan.query.identity.dataset == "ddb-history-native64") hash.update(canonical_native(row));
+                else if (plan.query.identity.dataset == "ddb-history-kline48") hash.update(canonical_kline(row));
+                else hash.update(canonical_row(row));
                 ++summary.rows;
                 selected.push_back(row);
             }

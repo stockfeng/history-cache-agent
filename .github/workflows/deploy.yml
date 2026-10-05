@@ -1,0 +1,79 @@
+name: Deploy history-cache-agent (single node)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Only this node is contacted; Cloud is never deployed
+        type: choice
+        options: [test-vps, oracle, aliyun]
+        required: true
+      operation:
+        description: Preflight is read-only; accept discards the stopped Agent backup
+        type: choice
+        options: [preflight, deploy, status, rollback, recover, accept]
+        default: preflight
+        required: true
+      release_commit:
+        description: Full reviewed commit SHA; deploy requires the image revision to match
+        type: string
+        required: true
+      image:
+        description: ghcr.io/stockfeng/history-cache-agent@sha256:... (deploy only)
+        type: string
+      bake_seconds:
+        description: Local UDS observation, 30-600 seconds
+        type: number
+        default: 120
+      adjustment:
+        description: Enable existing stock adjustment support (not futures/options)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: history-cache-agent-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: history-cache-${{ inputs.target }}
+    steps:
+      - name: Validate reviewed commit
+        env:
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: '[[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.release_commit }}
+          persist-credentials: false
+      - name: Offline deployment regression
+        run: |
+          bash -n docker/deploy-agent.sh
+          timeout --kill-after=5s 60s python3 -B -m unittest discover -s tests -p 'test_deploy*.py'
+      - name: SSH password transport dependency
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends sshpass
+      - name: Agent-only operation
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          AGENT_TARGET: ${{ inputs.target }}
+          AGENT_OPERATION: ${{ inputs.operation }}
+          AGENT_IMAGE: ${{ inputs.image }}
+          AGENT_RELEASE_COMMIT: ${{ inputs.release_commit }}
+          AGENT_BAKE_SECONDS: ${{ inputs.bake_seconds }}
+          AGENT_ADJUSTMENT: ${{ inputs.adjustment }}
+          AGENT_SSH_KEY: ${{ secrets.AGENT_SSH_KEY }}
+          AGENT_SSH_PASSWORD: ${{ secrets.AGENT_SSH_PASSWORD }}
+          AGENT_SSH_KNOWN_HOSTS: ${{ secrets.AGENT_SSH_KNOWN_HOSTS }}
+          AGENT_R2_CREDENTIALS_JSON: ${{ secrets.AGENT_R2_CREDENTIALS_JSON }}
+          AGENT_STORAGE_READER_JSON: ${{ secrets.AGENT_STORAGE_READER_JSON }}
+          AGENT_GHCR_USER: ${{ github.actor }}
+          AGENT_GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 -B docker/actions_deploy.py

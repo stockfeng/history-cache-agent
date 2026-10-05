@@ -13,6 +13,7 @@ struct PublishResult {
     PublishOutcome outcome = PublishOutcome::indeterminate;
     Pointer target;
     bool recovered = false;
+    std::optional<ErrorCode> error_code = std::nullopt;
 };
 
 Snapshot load_snapshot(const ObjectStore& store, uint64_t min_publication_seq = 0);
@@ -25,7 +26,9 @@ public:
     // dispatch. Persist that intent outside this class for process-crash recovery.
     // Never adopt a newer sequence to resolve an indeterminate result.
     // No pointer deletion/epoch reset is supported in this namespace.
-    [[nodiscard]] PublishResult publish(const Manifest& manifest, uint64_t expected_seq);
+    // epoch_base is an explicit migration authorization, pinned in the journal.
+    [[nodiscard]] PublishResult publish(const Manifest& manifest, uint64_t expected_seq,
+                                        const std::optional<Pointer>& epoch_base = std::nullopt);
 
 private:
     ObjectStore& store_;

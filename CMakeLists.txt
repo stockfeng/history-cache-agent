@@ -25,11 +25,17 @@ add_library(history_cache_core
     src/transport/curl_transport.cpp
     src/publisher/local_store.cpp
     src/publisher/publisher.cpp
+    src/publisher/factor_publisher.cpp
     src/publisher/journal.cpp
     src/staging/plan.cpp
     src/staging/ledger.cpp
     src/staging/executor.cpp
-    src/agent/reader.cpp)
+    src/agent/reader.cpp
+    src/agent/adjustment.cpp
+    src/agent/factor_snapshot.cpp
+    src/agent/market_clock.cpp
+    src/agent/maintenance.cpp
+    src/agent/service.cpp)
 target_include_directories(history_cache_core PUBLIC include)
 target_include_directories(history_cache_core PRIVATE src/core)
 target_link_libraries(history_cache_core PUBLIC
@@ -71,6 +77,9 @@ target_link_libraries(history-cache-snapshot PRIVATE history_cache_core)
 target_compile_options(history-cache-snapshot PRIVATE -Wall -Wextra -Wconversion -Wshadow -Werror)
 
 add_executable(history-cache-agent tools/history_cache_agent.cpp)
+add_executable(history-cache-factors tools/history_cache_factors.cpp)
+target_link_libraries(history-cache-factors PRIVATE history_cache_core)
+target_compile_options(history-cache-factors PRIVATE -Wall -Wextra -Wconversion -Wshadow -Werror)
 target_link_libraries(history-cache-agent PRIVATE history_cache_core pthread)
 target_compile_options(history-cache-agent PRIVATE -Wall -Wextra -Wconversion -Wshadow -Werror)
 
@@ -88,9 +97,26 @@ target_compile_options(history-cache-staging PRIVATE -Wall -Wextra -Wconversion 
 include(CTest)
 if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME factor_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_factors_cli.py
+        --tool $<TARGET_FILE:history-cache-factors>)
+    set_tests_properties(factor_cli PROPERTIES TIMEOUT 30)
+    add_executable(history-cache-adjustment-tests tests/adjustment_tests.cpp)
+    target_link_libraries(history-cache-adjustment-tests PRIVATE history_cache_core)
+    target_compile_options(history-cache-adjustment-tests PRIVATE -Wall -Wextra -Wconversion -Wshadow -Werror)
+    add_test(NAME adjustment COMMAND history-cache-adjustment-tests)
+    set_tests_properties(adjustment PROPERTIES TIMEOUT 15)
+    add_executable(history-cache-agent-tests tests/agent_tests.cpp)
+    target_link_libraries(history-cache-agent-tests PRIVATE history_cache_core pthread)
+    target_compile_options(history-cache-agent-tests PRIVATE -Wall -Wextra -Wconversion -Wshadow -Werror)
+    add_test(NAME agent_service COMMAND history-cache-agent-tests)
+    add_test(NAME agent_lifetime COMMAND history-cache-agent-tests lifetime)
+    add_test(NAME agent_uds COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_agent_uds.py
+        --agent $<TARGET_FILE:history-cache-agent>)
+    set_tests_properties(agent_service agent_uds PROPERTIES TIMEOUT 30)
+    set_tests_properties(agent_lifetime PROPERTIES TIMEOUT 80)
     add_test(NAME snapshot_cli COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_snapshot.py --tool $<TARGET_FILE:history-cache-snapshot>)
-    set_tests_properties(snapshot_cli PROPERTIES TIMEOUT 30 ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+    set_tests_properties(snapshot_cli PROPERTIES TIMEOUT 90 ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
     add_executable(history-cache-sample-transfer-tests tests/sample_transfer_tests.cpp)
     target_link_libraries(history-cache-sample-transfer-tests PRIVATE history_cache_core)
     target_compile_options(history-cache-sample-transfer-tests PRIVATE -Wall -Wextra -Wconversion -Wshadow -Werror)

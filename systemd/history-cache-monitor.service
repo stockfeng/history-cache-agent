@@ -1,0 +1,31 @@
+[Unit]
+Description=Low-priority local Agent health and optional notification
+After=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/history-cache/monitor.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -B ${HISTORY_CACHE_OPS}/agent_operations.py monitor --monitor-state /var/lib/history-cache-monitor $HISTORY_CACHE_ALERT_OPTIONS
+StateDirectory=history-cache-monitor
+StateDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=45
+TimeoutStopSec=5
+KillMode=control-group
+CPUQuota=5%
+CPUWeight=1
+MemoryMax=96M
+MemorySwapMax=0
+TasksMax=8
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/history-cache-monitor
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
