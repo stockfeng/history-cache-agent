@@ -318,6 +318,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('steps.build.outputs.digest', build)
         self.assertIn('workflow_call:', (ROOT / '.github/workflows/ci.yml').read_text())
 
+    def test_ctest_report_and_matrix_guard_use_same_absolute_path(self):
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        self.assertIn('--output-junit "$GITHUB_WORKSPACE/build/ctest.xml"', workflow)
+        self.assertIn('--junit "$GITHUB_WORKSPACE/build/ctest.xml"', workflow)
+        self.assertIn('fail-fast: false', workflow)
+
 
 if __name__ == '__main__':
     unittest.main()

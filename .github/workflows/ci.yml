@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
         sanitizers: ["OFF", "ON"]
     steps:
@@ -33,8 +34,8 @@ jobs:
         run: timeout --kill-after=5s 600s cmake --build build --parallel 2
       - name: Test
         run: |
-          timeout --kill-after=5s 300s ctest --test-dir build --output-on-failure --parallel 1 --no-tests=error --output-junit build/ctest.xml
-          timeout --kill-after=5s 10s python3 -B tests/check_ctest_matrix.py --junit build/ctest.xml
+          timeout --kill-after=5s 300s ctest --test-dir build --output-on-failure --parallel 1 --no-tests=error --output-junit "$GITHUB_WORKSPACE/build/ctest.xml"
+          timeout --kill-after=5s 10s python3 -B tests/check_ctest_matrix.py --junit "$GITHUB_WORKSPACE/build/ctest.xml"
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
