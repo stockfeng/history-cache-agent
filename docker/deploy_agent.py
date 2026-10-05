@@ -1,6 +1,7 @@
 """Journaled, bounded Agent-only Docker deployment. No Cloud or R2 operations."""
 
 import argparse
+import copy
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -202,6 +203,18 @@ def fingerprint(container):
     return digest({key: container[key] for key in ('Id', 'Image', 'Config', 'HostConfig', 'Mounts')})
 
 
+def matches_fingerprint(container, expected):
+    if fingerprint(container) == expected:
+        return True
+    # Docker can materialize false as null after start; both leave OOM killing enabled.
+    host = container['HostConfig']
+    if 'OomKillDisable' not in host or host['OomKillDisable'] is not None and host['OomKillDisable'] is not False:
+        return False
+    equivalent = copy.deepcopy(container)
+    equivalent['HostConfig']['OomKillDisable'] = False if host['OomKillDisable'] is None else None
+    return fingerprint(equivalent) == expected
+
+
 def config_files(container, socket_dir):
     files = {}
     require(len(container['Mounts']) <= 16, 'too many previous mounts')
@@ -269,7 +282,7 @@ class Deployment:
 
     def check_old(self, old):
         require(old is not None and old['Id'] == self.record['old']['id'] and
-                fingerprint(old) == self.record['old']['fingerprint'], 'previous container configuration changed')
+                matches_fingerprint(old, self.record['old']['fingerprint']), 'previous container configuration changed')
         require(config_files(old, self.socket_dir) == self.record['old']['files'], 'previous mounted config changed')
 
     def candidate(self, value):
@@ -442,7 +455,7 @@ class Deployment:
         current = self.docker.inspect(NAME)
         require(current is not None, 'committed candidate missing')
         self.candidate(current)
-        require(fingerprint(current) == self.record['candidate_fingerprint'] and
+        require(matches_fingerprint(current, self.record['candidate_fingerprint']) and
                 config_files(current, self.socket_dir) == self.record['candidate_files'], 'candidate configuration changed')
         self.healthy(current['Id'])
         backup = self.docker.inspect(BACKUP)
