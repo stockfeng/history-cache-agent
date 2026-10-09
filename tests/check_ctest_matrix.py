@@ -26,6 +26,8 @@ def main():
     assert {item.attrib["name"] for item in tests} == required, "CTest names differ from required matrix"
     assert all(item.attrib.get("status") == "run" and item.find("skipped") is None and item.find("failure") is None for item in tests), "nonpassing case"
     by_name = {item.attrib["name"]: (item.findtext("system-out") or "").splitlines() for item in tests}
+    assert all('test output was removed' not in line for lines in by_name.values() for line in lines), \
+        'truncated JUnit output; run CTest with --test-output-size-passed 8192'
     for suite, labels in manifest.items():
         for label in labels:
             lines = by_name[suite + "." + label]
@@ -52,6 +54,7 @@ def main():
     assert "PASS agent_maintenance cache_only warm refresh rate cadence lease_cancel singleflight hot2000" in by_name["agent_service"], "missing realtime-priority checks"
     assert "PASS agent_demand cold_default concurrent8_get3 expired_current_only revision pacing" in by_name["agent_service"], "missing demand checks"
     assert "PASS agent_complete kline48 exact_fields cold3 warm0 range legacy_miss UTC" in by_name["agent_service"], "missing complete kline checks"
+    assert "PASS suspension NULL visibility paging empty partial factors composite HK_zero_volume" in by_name["agent_service"], "missing suspension checks"
     assert "PASS agent_adjustment default_off cold5 hot0 native64 anchor revision rollback expiry partial_reject" in by_name["agent_service"], "missing factor snapshot integration checks"
     assert any(line.startswith("PASS adjustment ") for line in by_name["adjustment"]), "missing adjustment checks"
     for name in ("factor_journal_pins_intent_recovers_expired_ack_and_never_rewrites_unknown",

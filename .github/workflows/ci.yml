@@ -34,7 +34,7 @@ jobs:
         run: timeout --kill-after=5s 600s cmake --build build --parallel 2
       - name: Test
         run: |
-          timeout --kill-after=5s 300s ctest --test-dir build --output-on-failure --parallel 1 --no-tests=error --output-junit "$GITHUB_WORKSPACE/build/ctest.xml"
+          timeout --kill-after=5s 300s ctest --test-dir build --output-on-failure --parallel 1 --no-tests=error --test-output-size-passed 8192 --output-junit "$GITHUB_WORKSPACE/build/ctest.xml"
           timeout --kill-after=5s 10s python3 -B tests/check_ctest_matrix.py --junit "$GITHUB_WORKSPACE/build/ctest.xml"
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
