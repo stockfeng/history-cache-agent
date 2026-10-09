@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path
@@ -200,19 +201,36 @@ def digest(value):
 
 
 def fingerprint(container):
+    value = {key: container[key] for key in ('Id', 'Image', 'Config', 'HostConfig', 'Mounts')}
+    value['Mounts'] = sorted(value['Mounts'], key=lambda item: json.dumps(item, sort_keys=True))
+    return digest(value)
+
+
+def legacy_fingerprint(container):
     return digest({key: container[key] for key in ('Id', 'Image', 'Config', 'HostConfig', 'Mounts')})
 
 
 def matches_fingerprint(container, expected):
-    if fingerprint(container) == expected:
+    if fingerprint(container) == expected or legacy_fingerprint(container) == expected:
         return True
     # Docker can materialize false as null after start; both leave OOM killing enabled.
     host = container['HostConfig']
-    if 'OomKillDisable' not in host or host['OomKillDisable'] is not None and host['OomKillDisable'] is not False:
-        return False
-    equivalent = copy.deepcopy(container)
-    equivalent['HostConfig']['OomKillDisable'] = False if host['OomKillDisable'] is None else None
-    return fingerprint(equivalent) == expected
+    variants = [container]
+    if 'OomKillDisable' in host and (host['OomKillDisable'] is None or host['OomKillDisable'] is False):
+        equivalent = copy.deepcopy(container)
+        equivalent['HostConfig']['OomKillDisable'] = False if host['OomKillDisable'] is None else None
+        variants.append(equivalent)
+    for variant in variants:
+        if fingerprint(variant) == expected or legacy_fingerprint(variant) == expected:
+            return True
+        # Old journals hashed Docker's unordered Mounts array. Retain their exact
+        # hashes without changing any mount content or any other configuration.
+        if len(variant['Mounts']) <= 4:
+            for mounts in itertools.permutations(variant['Mounts']):
+                legacy = dict(variant, Mounts=list(mounts))
+                if legacy_fingerprint(legacy) == expected:
+                    return True
+    return False
 
 
 def config_files(container, socket_dir):
