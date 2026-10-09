@@ -196,6 +196,11 @@ GitHub Actions, R2 reads or any production deployment. A newly built GHCR digest
 is not automatically identical to an earlier locally frozen candidate.
 # Reviewed suspension policy delivery
 
+Docker inspect may reorder the `Mounts` array between reads (observed on Oracle
+2026-10-09). New deployment fingerprints sort that array; legacy journals with
+up to four mounts are verified against bounded permutations, never rewritten.
+All mount content, limits, image, identity and configuration remain protected.
+
 `install-policy` delivers a non-secret `suspensions.json` release asset through
 the same protected Environment and pinned SSH transport. Supply the reviewed
 installer commit, `suspension-policy-*` release tag and independently reviewed

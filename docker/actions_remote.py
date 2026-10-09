@@ -2,6 +2,8 @@
 
 from contextlib import contextmanager
 import fcntl
+import copy
+import itertools
 import json
 import os
 from pathlib import Path
@@ -184,6 +186,22 @@ def resource_preflight():
     return {'architecture': architecture, 'disk_free_mib': free // MIB, 'mem_available_mib': available // MIB}
 
 
+def fingerprint_diagnostics(container, expected):
+    result = dict(exact=deploy.fingerprint(container) == expected,
+                  oom_equivalent=deploy.matches_fingerprint(container, expected),
+                  mount_count=len(container['Mounts']),
+                  mount_order=[item['Destination'] for item in container['Mounts']],
+                  matches_with_mount_reordering=False)
+    if len(container['Mounts']) <= 4:
+        for mounts in itertools.permutations(container['Mounts']):
+            variant = copy.deepcopy(container)
+            variant['Mounts'] = list(mounts)
+            if deploy.matches_fingerprint(variant, expected):
+                result['matches_with_mount_reordering'] = True
+                break
+    return result
+
+
 class CheckedDocker(deploy.Docker):
     def __init__(self, architecture, revision):
         super().__init__()
@@ -253,6 +271,9 @@ def operate(request, bundle):
                     result['backup_files_match'] = deploy.config_files(backup, app.socket_dir) == record['old']['files']
                 except (OSError, ValueError):
                     result['backup_files_match'] = False
+                result['backup_fingerprint_observations'] = [
+                    fingerprint_diagnostics(backup, record['old']['fingerprint']),
+                    fingerprint_diagnostics(app.docker.inspect(backup['Id']), record['old']['fingerprint'])]
             if current:
                 result.update(candidate_identity_matches=current['Id'] == record['candidate'],
                     candidate_image_matches=current['Image'] == record['image_id'],
