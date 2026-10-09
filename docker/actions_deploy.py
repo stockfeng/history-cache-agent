@@ -11,7 +11,7 @@ import sys
 import tarfile
 import tempfile
 
-from actions_remote import validate_request, validate_storage
+from actions_remote import validate_request, validate_storage, deploy
 
 HOSTS = {'test-vps': '132.226.7.147', 'oracle': '151.145.72.82', 'aliyun': '139.196.115.141'}
 HELPERS = ('actions_remote.py', 'deploy_agent.py', 'probe-agent.py', 'snapshot-agent-config.py')
@@ -39,6 +39,15 @@ def make_request(env):
 def bundle(request, env):
     files = {name: Path(__file__).with_name(name).read_bytes() for name in HELPERS}
     files['request.json'] = json.dumps(request).encode()
+    if request['operation'] == 'install-policy':
+        source = Path(env.get('AGENT_POLICY_DIRECTORY', ''))
+        data = (source / 'suspensions.json').read_bytes()
+        expected = env.get('AGENT_POLICY_SHA256', '')
+        metadata = deploy.helper('snapshot-agent-config').validate_policy(data, expected)
+        if not metadata['intervals']:
+            raise ValueError('empty activation policy rejected')
+        files['suspensions.json'] = data
+        files['suspensions.sha256'] = (expected + '\n').encode()
     if request['operation'] in ('deploy', 'preflight'):
         credentials = env.get('AGENT_R2_CREDENTIALS_JSON', '')
         profile = env.get('AGENT_STORAGE_READER_JSON', '')

@@ -194,3 +194,14 @@ resource/image guards, real journal transitions with fake Docker, explicit
 recovery and Cloud state-change detection. They do not execute SSH, real Docker,
 GitHub Actions, R2 reads or any production deployment. A newly built GHCR digest
 is not automatically identical to an earlier locally frozen candidate.
+# Reviewed suspension policy delivery
+
+`install-policy` delivers a non-secret `suspensions.json` release asset through
+the same protected Environment and pinned SSH transport. Supply the reviewed
+installer commit, `suspension-policy-*` release tag and independently reviewed
+JSON SHA256. No new secret, container restart, market source or R2 write is used.
+It shares the Agent deployment concurrency/host locks and requires an ACCEPTED
+or ROLLED_BACK journal. Installation is create-only; identical partial delivery
+can resume, but differing existing files require a separately reviewed migration.
+The normal preflight/deploy subsequently freezes and checks the policy in the
+running Agent. Installing files alone does not activate the new reader.
