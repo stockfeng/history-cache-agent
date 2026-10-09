@@ -35,6 +35,9 @@ on:
       policy_sha256:
         description: Reviewed suspension JSON SHA256 (install-policy only)
         type: string
+      policy_previous_sha256:
+        description: Optional exact installed SHA256 for additive policy upgrade; old intervals retained
+        type: string
 
 permissions:
   contents: read
@@ -97,4 +100,5 @@ jobs:
           AGENT_GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AGENT_POLICY_DIRECTORY: ${{ runner.temp }}/reviewed-policy
           AGENT_POLICY_SHA256: ${{ inputs.policy_sha256 }}
+          AGENT_POLICY_PREVIOUS_SHA256: ${{ inputs.policy_previous_sha256 }}
         run: python3 -B docker/actions_deploy.py
