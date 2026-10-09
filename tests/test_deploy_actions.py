@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -171,8 +172,30 @@ class HostTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        config_patch = patch.object(remote, 'CONFIG_ROOT', self.root / 'server-config')
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
         private_json(self.root / 'credentials.json', CREDENTIALS)
         private_json(self.root / 'storage.json', PROFILE)
+
+    def test_server_policy_requires_pair_pin_and_private_files(self):
+        remote.CONFIG_ROOT.mkdir()
+        self.assertEqual(remote.suspension_config(), (None, None, None))
+        policy, pin = remote.CONFIG_ROOT / 'suspensions.json', remote.CONFIG_ROOT / 'suspensions.sha256'
+        private_json(policy, dict(schema_version=1, policy='a-share-null-placeholder-v1', intervals=[]))
+        with self.assertRaises(ValueError):
+            remote.suspension_config()
+        sha = hashlib.sha256(policy.read_bytes()).hexdigest()
+        pin.write_text(sha + '\n')
+        pin.chmod(0o600)
+        self.assertEqual(remote.suspension_config(), (policy, sha, dict(sha256=sha, intervals=0)))
+        policy.write_text('{}')
+        with self.assertRaises(ValueError):
+            remote.suspension_config()
+        policy.unlink()
+        policy.symlink_to(self.root / 'missing')
+        with self.assertRaises(ValueError):
+            remote.suspension_config()
 
     def test_private_config_reject_symlink_permissions_and_hardlink(self):
         self.assertEqual(remote.config_paths(self.root), (self.root / 'credentials.json', self.root / 'storage.json'))

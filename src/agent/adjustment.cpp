@@ -81,6 +81,7 @@ std::vector<Row> adjust_native_rows(const std::string& symbol,
         auto& prices = result[i].native->prices;
         const auto index = index_for(local_days[i]);
         for (auto& price : prices) {
+            if (price == kDdbNullPrice) continue;
             if (factors.model == AdjustmentModel::cumulative) {
                 // The upstream allows an explicitly empty factor set without rounding.
                 if (!factors.events.empty()) {
@@ -94,11 +95,14 @@ std::vector<Row> adjust_native_rows(const std::string& symbol,
             require(std::isfinite(price) && std::abs(price) <= std::numeric_limits<float>::max(),
                     "adjusted price cannot be encoded by client protocol");
         }
-        result[i].open = static_cast<float>(prices[0]);
-        result[i].high = static_cast<float>(prices[1]);
-        result[i].low = static_cast<float>(prices[2]);
-        result[i].close = static_cast<float>(prices[3]);
-        validate_row(result[i]);
+        const auto project = [](double price) {
+            return price == kDdbNullPrice ? std::numeric_limits<float>::quiet_NaN() : static_cast<float>(price);
+        };
+        result[i].open = project(prices[0]);
+        result[i].high = project(prices[1]);
+        result[i].low = project(prices[2]);
+        result[i].close = project(prices[3]);
+        (void)canonical_native(result[i]);
     }
     return result;
 }

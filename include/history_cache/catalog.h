@@ -14,6 +14,7 @@ struct CatalogEntry {
     Coverage coverage;
     uint64_t row_count = 0;
     std::optional<PackDescriptor> pack;
+    bool nullable_prices = false;
 };
 
 struct Manifest {

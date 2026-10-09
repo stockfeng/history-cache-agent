@@ -4,6 +4,20 @@ C++17 core and UDS agent for the R2 historical-cache project. This is an
 independent Git repository inside the integration workspace. Building or testing
 the component does not deploy services or publish data.
 
+## NULL compatibility, 2026-10-09 (local development)
+
+NULL compatibility is implemented locally for native64 packs: nullable entries
+declare `price_null_encoding=ddb-double-null-v1` (row schema 4), preserving the
+original DDB NULL sentinel. Agent `--suspensions-file` filters only confirmed
+A-share placeholder intervals before pagination/adjustment. No default list is
+installed; unknown NULLs fail closed. Readers must be upgraded before such packs
+are published. See the integration workspace's
+`docs/R2-NULL-SUSPENSION-COMPATIBILITY-20261009.md` for policy and tests.
+Normal non-NULL packs retain their existing format. The Actions adapter now
+snapshots the optional server-side `suspensions.json` + `suspensions.sha256` pair,
+mounts it read-only, and verifies the loaded hash through local UDS. See
+`deploy/GITHUB-ACTIONS.md`; this support does not install or confirm a real list.
+
 ## Factor versions versus source checks, 2026-10-06
 
 An already-published, hash-verified factor version does not expire with wall time.

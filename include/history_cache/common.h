@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -53,6 +54,18 @@ struct Coverage {
     int64_t start_ms = 0;
     int64_t end_ms = 0;
 };
+
+constexpr double kDdbNullPrice = -std::numeric_limits<double>::max();
+bool has_null_price(const Row& row);
+bool a_share_null_placeholder(const Row& row);
+
+struct ConfirmedSuspension {
+    std::string symbol;
+    Coverage coverage;
+};
+void validate_suspensions(const std::vector<ConfirmedSuspension>& intervals);
+bool confirmed_suspension(const Row& row, const std::string& symbol,
+                          const std::vector<ConfirmedSuspension>& intervals);
 
 struct SeriesIdentity {
     std::string dataset;
