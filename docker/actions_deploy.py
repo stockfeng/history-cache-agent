@@ -48,6 +48,11 @@ def bundle(request, env):
             raise ValueError('empty activation policy rejected')
         files['suspensions.json'] = data
         files['suspensions.sha256'] = (expected + '\n').encode()
+        previous = env.get('AGENT_POLICY_PREVIOUS_SHA256', '')
+        if previous:
+            if not re.fullmatch('[a-f0-9]{64}', previous) or previous == expected:
+                raise ValueError('distinct previous policy SHA256 required')
+            files['policy-previous.sha256'] = (previous + '\n').encode()
     if request['operation'] in ('deploy', 'preflight'):
         credentials = env.get('AGENT_R2_CREDENTIALS_JSON', '')
         profile = env.get('AGENT_STORAGE_READER_JSON', '')

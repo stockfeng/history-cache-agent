@@ -115,6 +115,10 @@ def install_policy(bundle):
     metadata = deploy.helper('snapshot-agent-config').validate_policy(data, expected)
     require(metadata['intervals'] > 0, 'empty activation policy rejected')
     deploy.private_directory(CONFIG_ROOT)
+    previous = bundle / 'policy-previous.sha256'
+    if previous.exists() or previous.is_symlink():
+        old_sha = private_read(previous, 65).decode('ascii').strip()
+        return extend_policy(data, expected, old_sha, metadata)
     payloads = {'suspensions.json': data, 'suspensions.sha256': (expected + '\n').encode()}
     # Create-only: an interrupted identical delivery can finish; a different policy cannot overwrite it.
     for name, payload in payloads.items():
@@ -142,6 +146,68 @@ def install_policy(bundle):
     require(suspension_config()[2] == metadata, 'installed policy verification failed')
     return dict(status='POLICY_INSTALLED' if installed else 'POLICY_ALREADY_INSTALLED',
                 suspension_policy=metadata, containers_changed=False, r2_data_health_tested=False)
+
+
+def policy_write(path, data, replace=False):
+    fd, temporary = tempfile.mkstemp(prefix='.policy-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o400)
+            os.fsync(stream.fileno())
+        if replace:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        deploy.sync_directory(path.parent)
+
+
+def extend_policy(data, expected, old_sha, metadata):
+    require(re.fullmatch('[a-f0-9]{64}', old_sha) and old_sha != expected,
+            'distinct reviewed previous policy SHA256 required')
+    history = CONFIG_ROOT / 'policy-upgrades'
+    deploy.private_directory(history)
+    transaction = history / (old_sha + '-' + expected)
+    deploy.private_directory(transaction)
+    marker = transaction / 'intent.json'
+    intent = dict(previous=old_sha, target=expected)
+    names = ('suspensions.json', 'suspensions.sha256')
+    new = (data, (expected + '\n').encode())
+    if marker.exists() or marker.is_symlink():
+        require(parse_object(private_read(marker), 4096) == intent, 'policy upgrade intent changed')
+        old = tuple(private_read(transaction / ('old-' + name), MIB) for name in names)
+    else:
+        old = tuple(private_read(CONFIG_ROOT / name, MIB) for name in names)
+    require(old[1] == (old_sha + '\n').encode(), 'previous policy pin differs')
+    deploy.helper('snapshot-agent-config').validate_policy(old[0], old_sha)
+    prior = parse_object(old[0], MIB)['intervals']
+    updated = parse_object(data, MIB)['intervals']
+    canonical = lambda rows: {json.dumps(row, sort_keys=True, separators=(',', ':')) for row in rows}
+    require(canonical(prior) <= canonical(updated) and len(canonical(updated)) == len(updated),
+            'policy extension must retain every confirmed interval and evidence without duplicates')
+    # The running Agent mounts its immutable release snapshot, never these source files.
+    for name, before, after in zip(names, old, new):
+        require(private_read(CONFIG_ROOT / name, MIB) in (before, after), 'unrelated policy source change')
+        for prefix, payload in (('old-', before), ('new-', after)):
+            path = transaction / (prefix + name)
+            if path.exists() or path.is_symlink():
+                require(private_read(path, MIB) == payload, 'policy upgrade backup changed')
+            else:
+                require(not marker.exists(), 'committed policy upgrade backup missing')
+                policy_write(path, payload)
+    if not marker.exists():
+        policy_write(marker, json.dumps(intent, sort_keys=True).encode())
+    # Both preimages are durable before either replacement; an identical retry resumes a partial pair.
+    for name, payload in zip(names, new):
+        if private_read(CONFIG_ROOT / name, MIB) != payload:
+            policy_write(CONFIG_ROOT / name, payload, replace=True)
+    require(suspension_config()[2] == metadata, 'extended policy verification failed')
+    return dict(status='POLICY_EXTENDED', previous_sha256=old_sha, suspension_policy=metadata,
+                backup=str(transaction), containers_changed=False, r2_data_health_tested=False)
 
 
 def docker_read(args):
