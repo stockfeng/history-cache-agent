@@ -11,7 +11,7 @@ on:
       operation:
         description: Preflight is read-only; accept discards the stopped Agent backup
         type: choice
-        options: [preflight, deploy, status, rollback, recover, accept]
+        options: [preflight, deploy, status, rollback, recover, accept, install-policy]
         default: preflight
         required: true
       release_commit:
@@ -29,6 +29,12 @@ on:
         description: Enable existing stock adjustment support (not futures/options)
         type: boolean
         default: true
+      policy_release_tag:
+        description: Reviewed policy release asset tag (install-policy only)
+        type: string
+      policy_sha256:
+        description: Reviewed suspension JSON SHA256 (install-policy only)
+        type: string
 
 permissions:
   contents: read
@@ -60,6 +66,19 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends sshpass
+      - name: Download pinned non-secret policy asset
+        if: inputs.operation == 'install-policy'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          POLICY_TAG: ${{ inputs.policy_release_tag }}
+          POLICY_SHA256: ${{ inputs.policy_sha256 }}
+        run: |
+          [[ "$POLICY_TAG" =~ ^suspension-policy-[0-9A-Za-z.-]+$ ]]
+          [[ "$POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          mkdir -m 700 "$RUNNER_TEMP/reviewed-policy"
+          timeout --kill-after=5s 90s gh release download "$POLICY_TAG" --pattern suspensions.json --dir "$RUNNER_TEMP/reviewed-policy"
+          printf '%s  %s\n' "$POLICY_SHA256" "$RUNNER_TEMP/reviewed-policy/suspensions.json" | sha256sum --check --status
       - name: Agent-only operation
         env:
           PYTHONDONTWRITEBYTECODE: '1'
@@ -76,4 +95,6 @@ jobs:
           AGENT_STORAGE_READER_JSON: ${{ secrets.AGENT_STORAGE_READER_JSON }}
           AGENT_GHCR_USER: ${{ github.actor }}
           AGENT_GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENT_POLICY_DIRECTORY: ${{ runner.temp }}/reviewed-policy
+          AGENT_POLICY_SHA256: ${{ inputs.policy_sha256 }}
         run: python3 -B docker/actions_deploy.py

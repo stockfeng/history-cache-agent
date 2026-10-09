@@ -14,7 +14,7 @@ import tempfile
 import deploy_agent as deploy
 
 IMAGE = re.compile(r'ghcr\.io/stockfeng/history-cache-agent@sha256:[a-f0-9]{64}\Z')
-OPERATIONS = ('preflight', 'deploy', 'status', 'rollback', 'recover', 'accept')
+OPERATIONS = ('preflight', 'deploy', 'status', 'rollback', 'recover', 'accept', 'install-policy')
 CONFIG_ROOT = Path('/etc/history-cache')
 STATE_ROOT = Path('/var/lib/history-cache/deployments')
 SOCKET_ROOT = Path('/var/lib/history-cache/socket')
@@ -107,6 +107,41 @@ def suspension_config():
     return path, expected, metadata
 
 
+def install_policy(bundle):
+    data = private_read(bundle / 'suspensions.json', MIB)
+    expected = private_read(bundle / 'suspensions.sha256', 65).decode('ascii').strip()
+    metadata = deploy.helper('snapshot-agent-config').validate_policy(data, expected)
+    require(metadata['intervals'] > 0, 'empty activation policy rejected')
+    deploy.private_directory(CONFIG_ROOT)
+    payloads = {'suspensions.json': data, 'suspensions.sha256': (expected + '\n').encode()}
+    # Create-only: an interrupted identical delivery can finish; a different policy cannot overwrite it.
+    for name, payload in payloads.items():
+        path = CONFIG_ROOT / name
+        if path.exists() or path.is_symlink():
+            require(private_read(path, MIB) == payload, 'existing policy differs; explicit migration required')
+    installed = False
+    for name, payload in payloads.items():
+        path = CONFIG_ROOT / name
+        if path.exists():
+            continue
+        fd, temporary = tempfile.mkstemp(prefix='.policy-', dir=CONFIG_ROOT)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fchmod(stream.fileno(), 0o400)
+                os.fsync(stream.fileno())
+            # link is no-clobber, unlike replace. Remove the temporary link before readers run.
+            os.link(temporary, path)
+            installed = True
+        finally:
+            os.unlink(temporary)
+            deploy.sync_directory(CONFIG_ROOT)
+    require(suspension_config()[2] == metadata, 'installed policy verification failed')
+    return dict(status='POLICY_INSTALLED' if installed else 'POLICY_ALREADY_INSTALLED',
+                suspension_policy=metadata, containers_changed=False, r2_data_health_tested=False)
+
+
 def docker_read(args):
     # Do not print daemon/inspect errors or full Config (may contain secrets).
     with tempfile.TemporaryFile() as output:
@@ -193,6 +228,12 @@ def registry_session(bundle):
 def operate(request, bundle):
     operation = request['operation']
     app = deploy.Deployment(STATE_ROOT, SOCKET_ROOT)
+    if operation == 'install-policy':
+        with app.journal.lock():
+            record = app.journal.read()
+            require(record is None or record['phase'] in ('ROLLED_BACK', 'ACCEPTED'),
+                    'policy delivery requires reconciled deployment journal')
+            return install_policy(bundle)
     if operation == 'status':
         with app.journal.lock():
             record = app.journal.read()
@@ -204,6 +245,14 @@ def operate(request, bundle):
             backup = app.docker.inspect(deploy.BACKUP)
             result.update(candidate_present=current is not None, backup_present=backup is not None,
                           previous_container_recorded=record['old'] is not None)
+            if backup and record['old']:
+                result.update(backup_identity_matches=backup['Id'] == record['old']['id'],
+                              backup_config_matches=deploy.matches_fingerprint(backup, record['old']['fingerprint']),
+                              backup_running=backup['State']['Running'])
+                try:
+                    result['backup_files_match'] = deploy.config_files(backup, app.socket_dir) == record['old']['files']
+                except (OSError, ValueError):
+                    result['backup_files_match'] = False
             if current:
                 result.update(candidate_identity_matches=current['Id'] == record['candidate'],
                     candidate_image_matches=current['Image'] == record['image_id'],
@@ -289,7 +338,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except ActionsError as error:
+    except (ActionsError, deploy.DeployError) as error:
         print('Agent operation blocked: ' + str(error), file=sys.stderr)
         raise SystemExit(1)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
