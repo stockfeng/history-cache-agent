@@ -77,6 +77,25 @@ void compare(const std::vector<hc::Row>& lhs, const std::vector<hc::Row>& rhs) {
 }
 
 void columns() {
+    hc::Row null_row{1000, 0, 0, 0, 0, 0};
+    null_row.native = hc::Row::NativeFields{{hc::kDdbNullPrice, 0, 0, hc::kDdbNullPrice}, 0, 0};
+    const auto nullable = hc::encode_columns({null_row}, 4);
+    check(nullable[0] == 3 && hc::same_row(hc::decode_columns(nullable, 1, 4)[0], null_row),
+          "native NULL roundtrip changed bytes");
+    rejects([&] { hc::encode_columns({null_row}, 3); }, "NULL accepted by old schema");
+    rejects([&] { hc::decode_columns(nullable, 1, 3); }, "nullable read as old schema");
+    auto disguised = nullable;
+    disguised[0] = 2;
+    rejects([&] { hc::decode_columns(disguised, 1, 3); }, "NULL hidden in old schema");
+    for (double invalid : {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+        auto bad = null_row;
+        bad.native->prices[0] = invalid;
+        rejects([&] { hc::encode_columns({bad}, 4); }, "nonfinite nullable price");
+    }
+    hc::validate_suspensions({{"000001.SZ", {1000, 2000}}});
+    check(hc::confirmed_suspension(null_row, "000001.SZ", {{"000001.SZ", {1000, 2000}}}), "confirmed row not recognized");
+    check(!hc::confirmed_suspension(null_row, "000001.SZ", {{"000001.SZ", {1, 1000}}}), "exclusive boundary ignored");
+    rejects([&] { hc::validate_suspensions({{"00700.HK", {1000, 2000}}}); }, "non-A policy accepted");
     const auto bytes = hc::read_file(fs::path(HC_SOURCE_DIR) / "tests/golden/columns-v1.json", hc::kMaxMetadataBytes);
     const auto golden = Json::parse(bytes);
     for (const auto& item : golden.at("cases")) {

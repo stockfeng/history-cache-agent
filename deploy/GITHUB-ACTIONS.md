@@ -73,6 +73,49 @@ certificate verification remains enabled. Helpers use only Python stdlib.
 
 ## Release sequence
 
+### Optional A-share NULL confirmation policy
+
+For nullable A-share packs, install a reviewed, matching pair on the selected
+Agent node before preflight, using the existing configuration delivery process:
+
+```text
+/etc/history-cache/suspensions.json
+/etc/history-cache/suspensions.sha256
+```
+
+Both files must be regular, root-owned, mode 0400/0600, without symlinks or hard
+links. The pin is exactly the lowercase SHA256 of the JSON bytes (optional final
+newline). No new GitHub secret, variable, workflow input, market SDK or timer is
+needed. Do not derive confirmations merely from observed NULLs. Maximum policy
+size is 1 MiB / 10,000 intervals. Duplicate/unknown fields and malformed intervals
+are rejected. Missing both files preserves legacy no-policy behavior; missing
+one or a hash mismatch blocks preflight. An already policy-enabled container
+cannot accidentally be redeployed without its policy.
+
+The host adapter revalidates the selected bytes and creates a private per-release
+snapshot BEFORE stopping the previous container. It adds the read-only mount
+`/run/config/history-suspensions.json` and passes `--suspensions-file` plus
+`--suspensions-sha256`. Runtime `suspension_policy_status` reports the immutable
+loaded hash/count and `price_null_encoding=ddb-double-null-v1`. This is separate
+from the unchanged PING/PONG protocol and performs no R2/DDB requests. Bake and
+accept compare this status; status also exposes `suspension_policy_matches`.
+Configuration file hashes remain part of the deployment journal. Rollback uses
+the previous container and its snapshot, not the edited source pair.
+
+Use the SAME bytes and SHA256 in Upcloud's independently deployed
+`history_dolphindb.kline_tables.stock.suspensions_file` / `suspensions_sha256`.
+Its `--check-config` validates the file before any connection. The integration
+workspace's `scripts/prepare_suspension_release.py` prepares both configuration
+artifacts without deploying either service. The Upcloud JSON output is a merge
+fragment, NOT a replacement for its existing database/table configuration.
+
+Deploy both readers and compare their loaded hashes before publishing nullable
+packs. This Agent workflow does not remotely verify or restart Upcloud. After
+nullable publication, rolling back to an old decoder may stop reads of those
+packs; preserve a compatible rollback release and coordinate both readers.
+
+### Build and single-node deployment
+
 1. Review and commit the complete candidate, including previously untracked
    Agent sources/helpers. Push to the Agent repository; the workflow must be
    present on its default branch to appear in manual Actions dispatch.

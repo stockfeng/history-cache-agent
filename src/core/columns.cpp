@@ -48,11 +48,12 @@ void zstd_ok(size_t result) {
 }  // namespace
 
 Bytes encode_columns(const std::vector<Row>& rows, uint16_t schema) {
-    detail::require(schema >= 1 && schema <= 3, "unsupported row schema");
+    detail::require(schema >= 1 && schema <= 4, "unsupported row schema");
     detail::require(!rows.empty() && rows.size() <= kBlockRows, "invalid block row count",
                     ErrorCode::resource_limit);
     for (const auto& row : rows) {
-        detail::require((schema == 3) == row.native.has_value(), "native schema mismatch");
+        detail::require((schema >= 3) == row.native.has_value(), "native schema mismatch");
+        detail::require(schema == 4 || !has_null_price(row), "NULL requires nullable schema");
         validate_row(row);
         if (schema == 1)
             detail::require(row.turnover == 0 && row.open_interest == 0,
@@ -69,13 +70,13 @@ Bytes encode_columns(const std::vector<Row>& rows, uint16_t schema) {
         previous_delta = delta;
     }
     Bytes bytes(16, 0);
-    bytes[0] = schema == 3 ? 2 : 1;
+    bytes[0] = schema == 4 ? 3 : schema == 3 ? 2 : 1;
     bytes[1] = 2;
     detail::put_be(bytes, 2, schema >= 2 ? 0x00ff : 0x003f, 2);
     detail::put_be(bytes, 4, rows.size(), 4);
     detail::put_be(bytes, 8, timestamps.size(), 4);
     bytes.insert(bytes.end(), timestamps.begin(), timestamps.end());
-    if (schema == 3) {
+    if (schema >= 3) {
         for (size_t i = 0; i < 4; ++i)
             for (const auto& row : rows) detail::append_le(bytes, detail::bits<uint64_t>(row.native->prices[i]), 8);
     } else {
@@ -89,7 +90,7 @@ Bytes encode_columns(const std::vector<Row>& rows, uint16_t schema) {
             detail::append_le(bytes, detail::bits<uint64_t>(row.turnover), 8);
         }
         for (const auto& row : rows) detail::append_le(bytes, static_cast<uint64_t>(row.open_interest), 8);
-    } else if (schema == 3) {
+    } else if (schema >= 3) {
         for (const auto& row : rows) {
             (void)canonical_native(row);
             detail::append_le(bytes, static_cast<uint64_t>(row.native->open_oi), 8);
@@ -101,14 +102,14 @@ Bytes encode_columns(const std::vector<Row>& rows, uint16_t schema) {
 }
 
 std::vector<Row> decode_columns(const Bytes& bytes, uint32_t expected_rows, uint16_t schema) {
-    detail::require(schema >= 1 && schema <= 3, "unsupported row schema");
+    detail::require(schema >= 1 && schema <= 4, "unsupported row schema");
     detail::require(expected_rows > 0 && expected_rows <= kBlockRows &&
                     bytes.size() >= 24 && bytes.size() <= kMaxBlockBytes, "invalid column block limits");
-    detail::require(bytes[0] == (schema == 3 ? 2 : 1) && bytes[1] == 2 && detail::be(bytes, 2, 2) == (schema >= 2 ? 0x00ffU : 0x003fU) &&
+    detail::require(bytes[0] == (schema == 4 ? 3 : schema == 3 ? 2 : 1) && bytes[1] == 2 && detail::be(bytes, 2, 2) == (schema >= 2 ? 0x00ffU : 0x003fU) &&
                     detail::be(bytes, 4, 4) == expected_rows && detail::be(bytes, 12, 4) == 0,
                     "column header schema mismatch");
     const uint64_t timestamp_bytes = detail::be(bytes, 8, 4);
-    detail::require(timestamp_bytes >= 8 && 16 + timestamp_bytes + uint64_t(expected_rows) * (schema == 3 ? 56U : schema == 2 ? 40U : 24U) == bytes.size(),
+    detail::require(timestamp_bytes >= 8 && 16 + timestamp_bytes + uint64_t(expected_rows) * (schema >= 3 ? 56U : schema == 2 ? 40U : 24U) == bytes.size(),
                     "column lengths mismatch");
     const size_t timestamp_end = static_cast<size_t>(16 + timestamp_bytes);
     const uint64_t first = detail::be(bytes, 16, 8);
@@ -132,7 +133,7 @@ std::vector<Row> decode_columns(const Bytes& bytes, uint32_t expected_rows, uint
         rows[i].timestamp_ms = rows[i - 1].timestamp_ms + delta;
     }
     detail::require(offset == timestamp_end, "timestamp column has trailing bytes");
-    if (schema == 3) {
+    if (schema >= 3) {
         for (auto& row : rows) row.native.emplace();
         for (size_t i = 0; i < 4; ++i) for (auto& row : rows) {
             row.native->prices[i] = detail::bits<double>(detail::le(bytes, offset, 8)); offset += 8;
@@ -154,11 +155,12 @@ std::vector<Row> decode_columns(const Bytes& bytes, uint32_t expected_rows, uint
             row.open_interest = detail::bits<int64_t>(detail::le(bytes, offset, 8)); offset += 8;
             (void)canonical_kline(row);
         }
-    } else if (schema == 3) {
+    } else if (schema >= 3) {
         for (auto& row : rows) { row.native->open_oi = detail::bits<int64_t>(detail::le(bytes, offset, 8)); offset += 8; }
         for (auto& row : rows) {
             row.native->close_oi = detail::bits<int64_t>(detail::le(bytes, offset, 8)); offset += 8;
             (void)canonical_native(row);
+            detail::require(schema == 4 || !has_null_price(row), "NULL requires nullable schema");
         }
     }
     return rows;

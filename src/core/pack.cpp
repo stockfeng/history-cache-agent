@@ -9,7 +9,7 @@ namespace history_cache {
 namespace {
 
 void validate_metadata(const PackMetadata& metadata) {
-    detail::require(metadata.row_schema >= 1 && metadata.row_schema <= 3, "unsupported row schema");
+    detail::require(metadata.row_schema >= 1 && metadata.row_schema <= 4, "unsupported row schema");
     validate_coverage(metadata.coverage);
     detail::require(metadata.source_version > 0 && metadata.data_version != Digest{} &&
                     metadata.series != SeriesId{}, "pack identity/version is missing", ErrorCode::invalid);
@@ -152,7 +152,7 @@ PackIndex read_pack_index(const RangeReader& read, const PackDescriptor& descrip
                         block.first_ms >= expected.coverage.start_ms && block.first_ms > last_ms &&
                         block.last_ms >= block.first_ms && block.last_ms < expected.coverage.end_ms &&
                         (block.rows != 1 || block.first_ms == block.last_ms) &&
-                        block.raw_bytes >= 24 + uint64_t(block.rows) * (expected.row_schema == 3 ? 56U : expected.row_schema == 2 ? 40U : 24U) && block.raw_bytes <= kMaxBlockBytes &&
+                        block.raw_bytes >= 24 + uint64_t(block.rows) * (expected.row_schema >= 3 ? 56U : expected.row_schema == 2 ? 40U : 24U) && block.raw_bytes <= kMaxBlockBytes &&
                         block.compressed_bytes > 0 && block.compressed_bytes <= kMaxBlockBytes &&
                         block.offset == offset && block.compressed_bytes <= descriptor.bytes - offset &&
                         detail::be(toc, pos + 40, 8) == 0, "invalid TOC entry");

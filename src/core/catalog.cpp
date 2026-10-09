@@ -66,10 +66,12 @@ Json entry_json(const CatalogEntry& entry) {
         object = {{"bytes", entry.pack->bytes}, {"index_sha256", hex(entry.pack->index_sha256)},
                   {"key", entry.pack->key}, {"sha256", hex(entry.pack->sha256)}};
     }
-    return {{"identity", identity_json(entry.identity)}, {"series_id", hex(series_id(entry.identity))},
+    Json result{{"identity", identity_json(entry.identity)}, {"series_id", hex(series_id(entry.identity))},
             {"data_version", hex(entry.data_version)}, {"source_version", entry.source_version},
             {"coverage_start_ms", entry.coverage.start_ms}, {"coverage_end_ms", entry.coverage.end_ms},
             {"coverage_complete", true}, {"rows", entry.row_count}, {"object", object}};
+    if (entry.nullable_prices) result["price_null_encoding"] = "ddb-double-null-v1";
+    return result;
 }
 
 }  // namespace
@@ -92,7 +94,7 @@ SeriesIdentity identity_from_json(const nlohmann::json& value) {
 
 PackMetadata pack_metadata(const CatalogEntry& entry) {
     return {series_id(entry.identity), entry.data_version, entry.source_version, entry.coverage, entry.row_count,
-            static_cast<uint16_t>(entry.identity.dataset == "ddb-history-native64" ? 3 : entry.identity.dataset == "ddb-history-kline48" ? 2 : 1)};
+            static_cast<uint16_t>(entry.nullable_prices ? 4 : entry.identity.dataset == "ddb-history-native64" ? 3 : entry.identity.dataset == "ddb-history-kline48" ? 2 : 1)};
 }
 
 void validate_manifest(const Manifest& manifest) {
@@ -103,6 +105,8 @@ void validate_manifest(const Manifest& manifest) {
     const CatalogEntry* previous = nullptr;
     for (const auto& entry : manifest.entries) {
         validate_identity(entry.identity);
+        detail::require(!entry.nullable_prices || entry.identity.dataset == "ddb-history-native64",
+                        "nullable prices require native64", ErrorCode::invalid);
         validate_coverage(entry.coverage);
         detail::require(entry.identity.period_seconds == 60 && entry.identity.adjust == "none",
                         "only none/1m catalog entries are supported", ErrorCode::invalid);
@@ -158,7 +162,7 @@ void validate_publication_transition(const Manifest& before, const Manifest& aft
                 detail::require(entry.data_version == old.data_version &&
                                 entry.coverage.start_ms == old.coverage.start_ms &&
                                 entry.coverage.end_ms == old.coverage.end_ms &&
-                                entry.row_count == old.row_count && same_object,
+                                entry.row_count == old.row_count && entry.nullable_prices == old.nullable_prices && same_object,
                                 "same source version cannot change an interval snapshot", ErrorCode::conflict);
             }
         }
@@ -208,9 +212,13 @@ Manifest parse_manifest(const std::string& text) {
     const auto& entries = value.at("entries");
     detail::require(entries.is_array() && entries.size() <= kMaxCatalogEntries, "invalid manifest entry list");
     for (const auto& item : entries) {
-        fields(item, {"identity", "series_id", "data_version", "source_version", "coverage_start_ms",
+        auto required = item;
+        const bool nullable = required.erase("price_null_encoding") != 0;
+        if (nullable) detail::require(item.at("price_null_encoding") == "ddb-double-null-v1", "unknown price null encoding");
+        fields(required, {"identity", "series_id", "data_version", "source_version", "coverage_start_ms",
                       "coverage_end_ms", "coverage_complete", "rows", "object"});
         CatalogEntry entry;
+        entry.nullable_prices = nullable;
         entry.identity = identity_from_json(item.at("identity"));
         detail::require(string(item, "series_id") == hex(series_id(entry.identity)), "series_id mismatch");
         detail::require(item.at("coverage_complete").is_boolean() && item.at("coverage_complete").get<bool>(),

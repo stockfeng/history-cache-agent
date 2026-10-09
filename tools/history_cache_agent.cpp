@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <poll.h>
+#include <set>
 #include <sys/socket.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -70,7 +71,7 @@ void load_credentials(const std::string& path, hc::AgentConfig& config) {
     }
 }
 
-void serve_connection(int fd, hc::Agent& agent, hc::Maintenance& maintenance) {
+void serve_connection(int fd, hc::Agent& agent, hc::Maintenance& maintenance, const Json& policy_status) {
     timeval timeout{2, 0};
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) return;
@@ -103,6 +104,7 @@ void serve_connection(int fd, hc::Agent& agent, hc::Maintenance& maintenance) {
                 response = {{"status", "ERROR"}, {"reason", "invalid_request"}};
             else if (op == "query" || op == "adjust_rows") response = agent.handle_query(request);
             else if (op == "ping") response = {{"status", "PONG"}};
+            else if (op == "suspension_policy_status") response = policy_status;
             else if (op == "maintenance_status") response = maintenance.status();
             else if (op == "maintenance_lease") {
                 const auto& until = request.at("valid_until_mono_ms");
@@ -140,6 +142,9 @@ int main(int argc, char* argv[]) {
         bool scope_flags = false;
         std::string warm_plan;
         bool file_seen = false;
+        bool suspensions_seen = false;
+        std::string policy_sha256;
+        std::string expected_policy_sha256;
         bool inline_credentials = false;
         bool reuse_connections = true;
         for (int i = 1; i < argc; ++i) {
@@ -168,6 +173,41 @@ int main(int argc, char* argv[]) {
                 if (!storage_file.empty() || value.empty()) throw std::runtime_error("duplicate storage config");
                 storage_file = value;
             }
+            else if (arg == "--suspensions-file") {
+                if (suspensions_seen || value.empty()) throw std::runtime_error("invalid suspensions file option");
+                suspensions_seen = true;
+                const auto bytes = hc::read_file(value, hc::kMaxMetadataBytes);
+                std::vector<std::set<std::string>> keys;
+                const auto policy = Json::parse(bytes, [&](int depth, Json::parse_event_t event, Json& parsed) {
+                    if (depth > 4) throw std::runtime_error("suspension policy nesting too deep");
+                    if (event == Json::parse_event_t::object_start) keys.emplace_back();
+                    if (event == Json::parse_event_t::key && !keys.back().insert(parsed.get<std::string>()).second)
+                        throw std::runtime_error("duplicate suspension policy key");
+                    if (event == Json::parse_event_t::object_end) keys.pop_back();
+                    return true;
+                });
+                if (!policy.is_object() || policy.size() != 3 || !policy.at("schema_version").is_number_integer() ||
+                    policy.at("schema_version") != 1 || policy.at("policy") != "a-share-null-placeholder-v1" ||
+                    !policy.at("intervals").is_array() || policy.at("intervals").size() > 10000)
+                    throw std::runtime_error("invalid suspension policy");
+                for (const auto& item : policy.at("intervals")) {
+                    if (!item.is_object() || item.size() != 4 ||
+                        !item.at("start_ms").is_number_integer() || !item.at("end_ms").is_number_integer() ||
+                        item.at("start_ms") <= 0 || item.at("end_ms") > 32503680000000LL - 28800000 ||
+                        item.at("evidence").get<std::string>().find_first_not_of(" \t\n\r\f\v") == std::string::npos)
+                        throw std::runtime_error("unconfirmed suspension interval");
+                    config.confirmed_suspensions.push_back({item.at("symbol").get<std::string>(),
+                        {item.at("start_ms").get<int64_t>(), item.at("end_ms").get<int64_t>()}});
+                }
+                hc::validate_suspensions(config.confirmed_suspensions);
+                policy_sha256 = hc::hex(hc::sha256(bytes));
+            }
+            else if (arg == "--suspensions-sha256") {
+                if (!expected_policy_sha256.empty() || value.size() != 64 ||
+                    value.find_first_not_of("0123456789abcdef") != std::string::npos)
+                    throw std::runtime_error("invalid suspensions SHA256 option");
+                expected_policy_sha256 = value;
+            }
             else if (arg == "--account") config.account_id = value;
             else if (arg == "--bucket") config.bucket = value;
             else if (arg == "--prefix") config.key_prefix = value;
@@ -194,6 +234,10 @@ int main(int argc, char* argv[]) {
             }
             else throw std::runtime_error("unknown argument");
         }
+        if (!expected_policy_sha256.empty() && expected_policy_sha256 != policy_sha256)
+            throw std::runtime_error("suspension policy SHA256 differs");
+        const Json policy_status = {{"status", "OK"}, {"sha256", policy_sha256},
+            {"intervals", config.confirmed_suspensions.size()}, {"price_null_encoding", "ddb-double-null-v1"}};
         if (file_seen) {
             if (inline_credentials) throw std::runtime_error("credentials-file conflicts with inline credentials");
             load_credentials(credentials_file, config);
@@ -274,7 +318,7 @@ int main(int argc, char* argv[]) {
                 pending.pop_front();
                 active[i] = client;
                 lock.unlock();
-                try { serve_connection(client, agent, maintenance); } catch (const std::exception&) {}
+                try { serve_connection(client, agent, maintenance, policy_status); } catch (const std::exception&) {}
                 lock.lock();
                 active[i] = -1;
                 close(client);

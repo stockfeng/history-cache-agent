@@ -95,6 +95,18 @@ def config_paths(bundle):
     return credentials, profile
 
 
+def suspension_config():
+    path, pin = CONFIG_ROOT / 'suspensions.json', CONFIG_ROOT / 'suspensions.sha256'
+    present = path.exists() or path.is_symlink()
+    pinned = pin.exists() or pin.is_symlink()
+    require(present == pinned, 'suspension file and SHA256 pin must be installed together')
+    if not present:
+        return None, None, None
+    expected = private_read(pin, 65).decode('ascii').strip()
+    metadata = deploy.helper('snapshot-agent-config').validate_policy(private_read(path, MIB), expected)
+    return path, expected, metadata
+
+
 def docker_read(args):
     # Do not print daemon/inspect errors or full Config (may contain secrets).
     with tempfile.TemporaryFile() as output:
@@ -206,9 +218,18 @@ def operate(request, bundle):
                     result['uds_ping'] = True
                 except (ValueError, OSError):
                     result['uds_ping'] = False
+                if record.get('suspension_policy'):
+                    result['suspension_policy'] = record['suspension_policy']
+                    try:
+                        deploy.helper('probe-agent').suspension_policy(str(app.socket_dir / 'agent.sock'),
+                                                                    record['suspension_policy'])
+                        result['suspension_policy_matches'] = True
+                    except (ValueError, OSError):
+                        result['suspension_policy_matches'] = False
             return result
     if operation in ('preflight', 'deploy'):
         credentials, profile = config_paths(bundle)
+        suspensions, policy_sha256, policy = suspension_config()
         resources = resource_preflight()
         with app.journal.lock():
             record = app.journal.read()
@@ -216,12 +237,15 @@ def operate(request, bundle):
                 'existing release requires explicit accept, rollback or recovery')
         app.docker.budget(30)
         require(app.docker.inspect(deploy.BACKUP) is None, 'retained Agent backup requires reconciliation')
+        deploy.require_policy_retained(app.docker.inspect(deploy.NAME), suspensions)
         if operation == 'preflight':
-            return dict(resources, status='PREFLIGHT_OK', image_pulled=False, r2_data_health_tested=False)
+            return dict(resources, status='PREFLIGHT_OK', image_pulled=False, r2_data_health_tested=False,
+                        suspension_policy=policy)
         app.docker = CheckedDocker(resources['architecture'], request['revision'])
         with registry_session(bundle):
             result = app.deploy(request['image'], request['bake'], credentials, profile,
-                                adjustment=request['adjustment'], network='bridge')
+                                adjustment=request['adjustment'], network='bridge',
+                                suspensions=suspensions, suspensions_sha256=policy_sha256)
     elif operation == 'rollback':
         result = app.rollback()
     elif operation == 'recover':

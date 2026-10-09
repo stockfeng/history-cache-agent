@@ -29,7 +29,10 @@ def read(path, maximum=1024 * 1024):
 
 def decode_pack(payload, entry, max_rows=5000):
     schema = 3 if entry["identity"]["dataset"] == "ddb-history-native64" else 2 if entry["identity"]["dataset"] == "ddb-history-kline48" else 1
-    row_format = struct.Struct("<q4d3q" if schema == 3 else "<q4fqdq" if schema == 2 else "<q4fq")
+    if "price_null_encoding" in entry:
+        check(schema == 3 and entry["price_null_encoding"] == "ddb-double-null-v1", "invalid nullable schema")
+        schema = 4
+    row_format = struct.Struct("<q4d3q" if schema >= 3 else "<q4fqdq" if schema == 2 else "<q4fq")
     descriptor = entry["object"]
     check(len(payload) == descriptor["bytes"] and sha(payload) == descriptor["sha256"]
           and descriptor["key"] == "data/v1/" + sha(payload) + ".r2b", "pack hash or size mismatch")
@@ -63,7 +66,9 @@ def decode_pack(payload, entry, max_rows=5000):
         for row in values:
             check(start <= row[0] < end and row[0] > previous and row[-1] >= 0, "invalid decoded row")
             check(row[5] >= 0 and all(math.isfinite(value) for value in row[1:5])
-                  and (schema == 1 or math.isfinite(row[6])) and (schema != 3 or row[6] >= 0), "invalid decoded fields")
+                  and (schema == 1 or math.isfinite(row[6])) and (schema < 3 or row[6] >= 0), "invalid decoded fields")
+            check(schema == 4 or all(value != -float.fromhex('0x1.fffffffffffffp+1023') for value in row[1:5]),
+                  "NULL requires nullable schema")
             previous = row[0]
             decoded.extend(row_format.pack(*row))
         cursor += size

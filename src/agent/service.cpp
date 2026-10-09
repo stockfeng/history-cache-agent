@@ -171,6 +171,7 @@ Agent::Agent(AgentConfig config, std::shared_ptr<HttpTransport> transport)
     : config_(std::move(config)),
       credentials_(std::make_shared<S3Credentials>(config_.access_key_id, config_.secret_access_key)),
       transport_(std::move(transport)) {
+    validate_suspensions(config_.confirmed_suspensions);
     if (!transport_ || config_.max_rows == 0 || config_.max_rows > 5000 ||
         config_.manifest_ttl_seconds > 86400 ||
         config_.max_requests == 0 || config_.max_requests > 4096 ||
@@ -507,6 +508,9 @@ Json Agent::query(const Json& request, QueryContext& query) {
                     std::memcpy(&row.native->prices[i], &bits, 8);
                 }
                 (void)canonical_native(row);
+                // Prefix and tail must already have applied the same visibility
+                // policy before their row limits. Never shrink a composite here.
+                if (has_null_price(row)) throw Error(ErrorCode::invalid, "unfiltered NULL in composite");
                 if (row.timestamp_ms <= previous || row.timestamp_ms < start || row.timestamp_ms >= end ||
                     (rows.size() < prefix_rows ? row.timestamp_ms >= split : row.timestamp_ms < split))
                     throw Error(ErrorCode::invalid, "unordered or out-of-range composite");
@@ -607,6 +611,11 @@ Json Agent::query(const Json& request, QueryContext& query) {
         Sha256 hash;
         Bytes data;
         uint64_t count = 0;
+        uint64_t scanned = 0, omitted = 0;
+        std::vector<ConfirmedSuspension> suspensions;
+        for (const auto& item : config_.confirmed_suspensions)
+            if (item.symbol == symbol && item.coverage.start_ms < end && item.coverage.end_ms > start)
+                suspensions.push_back(item);
         std::vector<Row> adjustment_rows;
         std::vector<int64_t> adjustment_days;
         int64_t first = 0, last = 0, previous = -1;
@@ -632,6 +641,8 @@ Json Agent::query(const Json& request, QueryContext& query) {
                 if (count >= max_rows) break;
                 if (block.last_ms < match.start || block.first_ms >= match.end) continue;
                 query.phase = "block";
+                if (query.limits.cancelled->load() || SteadyClock::now() >= query.limits.deadline)
+                    throw Error(ErrorCode::resource_limit, "query scan deadline reached");
                 for (auto row : read_pack_block(range, block)) {
                     if (row.timestamp_ms < match.start || row.timestamp_ms >= match.end) continue;
                     if (count >= max_rows) break;
@@ -641,6 +652,13 @@ Json Agent::query(const Json& request, QueryContext& query) {
                     validate_row(row);
                     if (row.timestamp_ms <= previous) throw Error(ErrorCode::corrupt, "unordered rows");
                     previous = row.timestamp_ms;
+                    if (++scanned > kMaxRows) throw Error(ErrorCode::resource_limit, "query scan row limit");
+                    if (has_null_price(row)) {
+                        if (!confirmed_suspension(row, symbol, suspensions))
+                            throw Error(ErrorCode::invalid, "unclassified NULL price row");
+                        ++omitted;
+                        continue;
+                    }
                     if (count == 0) first = row.timestamp_ms;
                     last = row.timestamp_ms;
                     if (adjusted) {
@@ -686,6 +704,7 @@ Json Agent::query(const Json& request, QueryContext& query) {
         }
         Json result = {{"status", partial ? "PARTIAL" : "HIT"}, {"rows", count}, {"first_ms", first}, {"last_ms", last},
                 {"rows_sha256", hex(hash.finish())}, {"data", hex(data.data(), data.size())}, {"sources", namespaces}};
+        result["omitted_suspension_rows"] = omitted;
         if (adjusted) result["adjustment"] = std::move(adjustment);
         if (partial || intraday || allow_partial) {
             result["coverage_start_ms"] = start;

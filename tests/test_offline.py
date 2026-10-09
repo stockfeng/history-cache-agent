@@ -50,9 +50,10 @@ def identity_hash(identity):
 
 def decode_columns(raw, expected_schema=1):
     schema, encoding, flags, count, timestamp_bytes, reserved = struct.unpack_from("!BBHIII", raw)
-    assert expected_schema in (1, 2, 3)
-    assert (schema, encoding, flags, reserved) == (2 if expected_schema == 3 else 1, 2, 0xFF if expected_schema >= 2 else 0x3F, 0)
-    assert len(raw) == 16 + timestamp_bytes + count * (56 if expected_schema == 3 else 40 if expected_schema == 2 else 24)
+    assert expected_schema in (1, 2, 3, 4)
+    assert 1 <= expected_schema <= 4
+    assert (schema, encoding, flags, reserved) == (3 if expected_schema == 4 else 2 if expected_schema == 3 else 1, 2, 0xFF if expected_schema >= 2 else 0x3F, 0)
+    assert len(raw) == 16 + timestamp_bytes + count * (56 if expected_schema >= 3 else 40 if expected_schema == 2 else 24)
     timestamps = [struct.unpack_from("!q", raw, 16)[0]]
     offset = 24
     delta = 0
@@ -71,10 +72,10 @@ def decode_columns(raw, expected_schema=1):
     assert offset == 16 + timestamp_bytes
     prices = []
     for _ in range(4):
-        prices.append(struct.unpack_from(f"<{count}" + ("d" if expected_schema == 3 else "f"), raw, offset))
-        offset += count * (8 if expected_schema == 3 else 4)
+        prices.append(struct.unpack_from(f"<{count}" + ("d" if expected_schema >= 3 else "f"), raw, offset))
+        offset += count * (8 if expected_schema >= 3 else 4)
     volume = struct.unpack_from(f"<{count}q", raw, offset)
-    if expected_schema == 3:
+    if expected_schema >= 3:
         open_oi = struct.unpack_from(f"<{count}q", raw, offset + count * 8)
         close_oi = struct.unpack_from(f"<{count}q", raw, offset + count * 16)
         return list(zip(timestamps, *prices, volume, open_oi, close_oi))

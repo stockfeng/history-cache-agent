@@ -6,12 +6,12 @@ import sys
 import time
 
 
-def probe(path):
+def request(path, operation):
     deadline = time.monotonic() + 2
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(2)
         client.connect(path)
-        client.sendall(b'{"op":"ping"}\n')
+        client.sendall((json.dumps({'op': operation}, separators=(',', ':')) + '\n').encode())
         data = bytearray()
         while b'\n' not in data:
             remaining = deadline - time.monotonic()
@@ -24,8 +24,19 @@ def probe(path):
             data.extend(chunk)
             if len(data) > 1024:
                 raise ValueError('oversized agent response')
-        if json.loads(data) != {'status': 'PONG'}:
-            raise ValueError('unexpected agent response')
+        return json.loads(data)
+
+
+def probe(path):
+    if request(path, 'ping') != {'status': 'PONG'}:
+        raise ValueError('unexpected agent response')
+
+
+def suspension_policy(path, expected):
+    value = request(path, 'suspension_policy_status')
+    if value != dict(status='OK', price_null_encoding='ddb-double-null-v1', **expected):
+        raise ValueError('loaded suspension policy differs from deployment snapshot')
+    return value
 
 
 if __name__ == '__main__':

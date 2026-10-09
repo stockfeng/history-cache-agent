@@ -1,6 +1,7 @@
 """Local UDS framing/shutdown tests; no query may reach the network backend."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -46,6 +47,27 @@ def main():
         rejected(command + ['--reuse-connections', 'maybe'])
         rejected(command + ['--foreground-network', 'maybe'])
         rejected(command + ['--adjustment', 'maybe'])
+        policy = Path(directory) / 'suspensions.json'
+        valid_policy = {'schema_version': 1, 'policy': 'a-share-null-placeholder-v1', 'intervals': []}
+        policy.write_text(json.dumps(valid_policy))
+        rejected(command + ['--suspensions-file', str(policy), '--suspensions-file', str(policy)])
+        for entry in ({'symbol': '00700.HK', 'start_ms': 1000, 'end_ms': 2000, 'evidence': 'test'},
+                      {'symbol': '000001.SZ', 'start_ms': 2000, 'end_ms': 1000, 'evidence': 'test'},
+                      {'symbol': '000001.SZ', 'start_ms': 1000, 'end_ms': 2000, 'evidence': ''}):
+            policy.write_text(json.dumps({**valid_policy, 'intervals': [entry]}))
+            rejected(command + ['--suspensions-file', str(policy)])
+        policy.write_text(json.dumps(valid_policy))
+        rejected(command + ['--suspensions-sha256', 'f' * 64])
+        rejected(command + ['--suspensions-file', str(policy), '--suspensions-sha256', 'f' * 64])
+        for data in (json.dumps(valid_policy)[:-1] + ',"schema_version":1}',
+                     json.dumps(dict(valid_policy, extra=1)),
+                     json.dumps(dict(valid_policy, schema_version=1.0))):
+            policy.write_text(data)
+            rejected(command + ['--suspensions-file', str(policy)])
+        policy.write_text(json.dumps(valid_policy))
+        policy_sha = hashlib.sha256(policy.read_bytes()).hexdigest()
+        command += ['--suspensions-file', str(policy)]
+        command += ['--suspensions-sha256', policy_sha]
         plan = Path(directory) / 'warm.json'
         plan.write_text('{}')
         rejected(command + ['--warm-plan', str(plan)])
@@ -54,16 +76,16 @@ def main():
             rejected(command + [option, value])
         link = Path(directory) / 'link'
         link.symlink_to(credentials)
-        rejected(command[:-1] + [str(link)])
+        rejected([str(link) if arg == str(credentials) else arg for arg in command])
         link.unlink()
         os.link(credentials, link)
         rejected()
         link.unlink()
         fifo = Path(directory) / 'fifo'
         os.mkfifo(fifo, 0o600)
-        rejected(command[:-1] + [str(fifo)])
-        rejected(command[:-1] + [directory])
-        rejected(command[:-1] + [str(Path(directory) / 'missing')])
+        rejected([str(fifo) if arg == str(credentials) else arg for arg in command])
+        rejected([directory if arg == str(credentials) else arg for arg in command])
+        rejected([str(Path(directory) / 'missing') if arg == str(credentials) else arg for arg in command])
         profile = Path(directory) / 'storage.json'
         storage = {'version': 1, 'environment': 'production', 'account_id': 'a' * 32,
                    'bucket': 'history-cache-production', 'prefix': 'r2-history-production/',
@@ -135,6 +157,14 @@ def main():
                 'range_semantics': 'half-open', 'row_encoding': 'le-ddb-native64-v1', 'adjust': 'forward'})
             assert adjusted['status'] == 'MISS' and adjusted['reason'] == 'unsupported_series'
             assert adjusted['metrics']['http'] == {}, 'disabled adjustment used network'
+            expected_policy_status = dict(status='OK', sha256=policy_sha, intervals=0,
+                                          price_null_encoding='ddb-double-null-v1')
+            assert control({'op': 'suspension_policy_status'}) == expected_policy_status
+            assert control({'op': 'ping'}) == {'status': 'PONG'}
+            original_policy = policy.read_bytes()
+            policy.write_text('{}')
+            assert control({'op': 'suspension_policy_status'}) == expected_policy_status, 'status re-read mutable input'
+            policy.write_bytes(original_policy)
             client = connect()
             for part in (b'ADJU', b'ST64\n', b'{"op":"adjust_rows","padding":"', b'x' * 10000, b'"}\n'):
                 client.sendall(part)

@@ -135,6 +135,7 @@ std::vector<hc::Row> parse_rows(const hc::Bytes& bytes, const hc::CatalogEntry& 
             row.native->open_oi = static_cast<int64_t>(open_oi);
             row.native->close_oi = static_cast<int64_t>(close_oi);
             (void)hc::canonical_native(row);
+            require(entry.nullable_prices || !hc::has_null_price(row), "NULL requires explicit price encoding");
             require(row.timestamp_ms > previous && row.timestamp_ms >= entry.coverage.start_ms &&
                     row.timestamp_ms < entry.coverage.end_ms, "unordered or out-of-coverage row");
             previous = row.timestamp_ms;
@@ -243,6 +244,10 @@ hc::Manifest daily_source_manifest(const Json& source) {
     (void)hc::parse_digest(source.at("raw_rows_sha256").get<std::string>());
     (void)hc::parse_digest(source.at("rows_sha256").get<std::string>());
     hc::CatalogEntry entry;
+    if (source.contains("price_null_encoding")) {
+        require(native && source.at("price_null_encoding") == "ddb-double-null-v1", "unknown price null encoding");
+        entry.nullable_prices = true;
+    }
     entry.identity = hc::identity_from_json(source.at("identity"));
     require(entry.identity.dataset == (native ? "ddb-history-native64" : complete ? "ddb-history-kline48" : "ddb-history-snapshot") && entry.identity.period_seconds == 60 &&
             entry.identity.adjust == "none" &&
@@ -343,6 +348,7 @@ hc::Manifest source_manifest(const Json& source) {
                 (!proof.contains("trading_day") || proof.at("trading_day").is_null()) && !proof.contains("window_contract"),
                 "compaction requires contiguous physical days at one native guard/version");
         rows += item.row_count;
+        entry.nullable_prices = entry.nullable_prices || item.nullable_prices;
         previous = item.coverage.end_ms;
     }
     require(rows <= kMonthRows, "compact rows exceed limit");

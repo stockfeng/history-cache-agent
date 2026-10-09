@@ -224,10 +224,21 @@ def config_files(container, socket_dir):
             continue
         require(mount['Type'] == 'bind' and not mount['RW'], 'unsupported previous writable or volume mount')
         path = Path(mount['Source'])
-        require(path.absolute() == path.resolve() and path.is_file() and path.stat().st_size <= 65536,
+        limit = 1024 * 1024 if mount['Destination'] == '/run/config/history-suspensions.json' else 65536
+        require(path.absolute() == path.resolve() and path.is_file() and path.stat().st_size <= limit,
                 'unsafe previous configuration mount')
-        files[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        with path.open('rb') as stream:
+            data = stream.read(limit + 1)
+        require(len(data) <= limit, 'previous configuration mount grew beyond limit')
+        files[str(path)] = hashlib.sha256(data).hexdigest()
     return files
+
+
+def require_policy_retained(container, suspensions):
+    if container:
+        configured = '--suspensions-file' in (container['Config'].get('Cmd') or []) or any(
+            m['Destination'] == '/run/config/history-suspensions.json' for m in container['Mounts'])
+        require(not configured or suspensions is not None, 'refusing to remove an active suspension policy')
 
 
 class Deployment:
@@ -269,6 +280,9 @@ class Deployment:
                 not value['State'].get('OOMKilled'), 'Agent is not running normally')
         require(not fresh or value['RestartCount'] == 0, 'candidate restarted')
         self.probe(str(self.socket_dir / 'agent.sock'))
+        if self.record and identity == self.record['candidate'] and self.record.get('suspension_policy'):
+            helper('probe-agent').suspension_policy(str(self.socket_dir / 'agent.sock'),
+                                                  self.record['suspension_policy'])
 
     def wait_ready(self, identity, fresh=False):
         for attempt in range(10):
@@ -292,7 +306,8 @@ class Deployment:
                 'unrelated container occupies deployment name')
         return value['Id']
 
-    def deploy(self, image, bake, credentials, profile=None, *, local_image=False, adjustment=False, network='bridge'):
+    def deploy(self, image, bake, credentials, profile=None, *, local_image=False, adjustment=False, network='bridge',
+               suspensions=None, suspensions_sha256=None):
         require((LOCAL_IMAGE.fullmatch(image) if local_image else IMAGE.fullmatch(image)) and
                 type(bake) is int and 1 <= bake <= 3600 and network in ('bridge', 'host'),
                 'invalid image digest, network or bake duration')
@@ -305,6 +320,7 @@ class Deployment:
             self.docker.budget(300)
             require(self.docker.inspect(BACKUP) is None, 'rollback container already exists')
             old = self.docker.inspect(NAME)
+            require_policy_retained(old, suspensions)
             if old:
                 require(old['HostConfig']['RestartPolicy']['Name'] in ('no', 'unless-stopped'),
                         'previous restart policy is unsafe for retained backup')
@@ -320,13 +336,15 @@ class Deployment:
             require(not local_image or image_info[0]['Id'] == image, 'local image ID differs')
             transaction = uuid.uuid4().hex
             release = self.journal.root / ('release-' + transaction)
-            helper('snapshot-agent-config').snapshot(release, credentials, profile)
+            policy = helper('snapshot-agent-config').snapshot(release, credentials, profile,
+                                                             suspensions, suspensions_sha256)
             require(self.socket_dir == self.socket_dir.resolve(), 'unsafe socket directory')
             self.socket_dir.mkdir(parents=True, exist_ok=True)
             self.record = dict(version=1, transaction=transaction, name=NAME, backup=BACKUP,
                                image=image, image_id=image_info[0]['Id'], local_image=local_image,
                                adjustment=adjustment, network=network, old=old_record, candidate=None,
                                candidate_fingerprint=None, candidate_files=None,
+                               suspension_policy=policy,
                                release=str(release), socket_dir=str(self.socket_dir),
                                phase='PREPARED', pending=None, acknowledgements=0)
             self.save()
@@ -348,10 +366,15 @@ class Deployment:
                         '-v', str(release / 'credentials.json') + ':/run/secrets/history-cache.json:ro']
                 if profile:
                     args += ['-v', str(release / 'storage.json') + ':/run/config/history-storage.json:ro']
+                if policy:
+                    args += ['-v', str(release / 'suspensions.json') + ':/run/config/history-suspensions.json:ro']
                 args += [image, '--socket', '/run/history-cache/agent.sock',
                          '--credentials-file', '/run/secrets/history-cache.json']
                 if profile:
                     args += ['--storage-config', '/run/config/history-storage.json']
+                if policy:
+                    args += ['--suspensions-file', '/run/config/history-suspensions.json',
+                             '--suspensions-sha256', policy['sha256']]
                 args += ['--foreground-network', 'yes', '--pack-cache-bytes', '33554432']
                 if adjustment:
                     args += ['--adjustment', 'yes']
@@ -370,6 +393,8 @@ class Deployment:
                     self.healthy(self.record['candidate'], True)
                     self.sleep(max(0, min(1, end - time.monotonic())))
                 self.healthy(self.record['candidate'], True)
+                require(config_files(self.docker.inspect(NAME), self.socket_dir) == self.record['candidate_files'],
+                        'candidate mounted config changed during bake')
                 self.save('COMMITTED')
                 return 'COMMITTED'
             except UnknownOutcome:
@@ -484,6 +509,8 @@ def main():
     parser.add_argument('--acknowledge-unknown', action='store_true')
     parser.add_argument('--local-image', action='store_true', help='use an already loaded exact sha256 image ID, without pulling')
     parser.add_argument('--adjustment', action='store_true')
+    parser.add_argument('--suspensions-file', type=Path)
+    parser.add_argument('--suspensions-sha256')
     parser.add_argument('--network', choices=('bridge', 'host'), default='bridge')
     parser.add_argument('--engine', default='docker')
     parser.add_argument('--docker-socket')
@@ -496,7 +523,8 @@ def main():
     require(sum((bool(args.image), args.recover, args.status, args.accept, args.rollback)) == 1,
             'choose deploy, recover, status, rollback or accept')
     require(not args.acknowledge_unknown or args.recover, 'acknowledgement only applies to recovery')
-    require(args.image or not (args.local_image or args.adjustment or args.network != 'bridge'),
+    require(args.image or not (args.local_image or args.adjustment or args.network != 'bridge' or
+                              args.suspensions_file or args.suspensions_sha256),
             'deployment options require an image')
     deployment = Deployment(args.state_root, args.socket_dir, Docker(args.engine, args.docker_socket))
     if args.status:
@@ -517,7 +545,8 @@ def main():
         result = deployment.rollback()
     else:
         result = deployment.deploy(args.image, args.bake, args.credentials, args.profile,
-                                   local_image=args.local_image, adjustment=args.adjustment, network=args.network)
+                                   local_image=args.local_image, adjustment=args.adjustment, network=args.network,
+                                   suspensions=args.suspensions_file, suspensions_sha256=args.suspensions_sha256)
     print(json.dumps({'status': result, 'cloud_modified': False, 'r2_data_health_tested': False}))
 
 

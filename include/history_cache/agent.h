@@ -28,6 +28,7 @@ struct AgentConfig {
     bool enable_adjustment = false;
     std::string storage_environment = "staging";
     std::string jurisdiction = "default";
+    std::vector<ConfirmedSuspension> confirmed_suspensions;
 };
 
 class Agent {

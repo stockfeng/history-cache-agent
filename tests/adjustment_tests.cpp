@@ -191,6 +191,15 @@ int main() {
     check(truncated[0].native->prices[0] == 10.13);
     auto backward = apply(rows, {9, 20}, AdjustmentMode::backward);
     check(backward[0].native->prices[0] == 10.13 && backward[1].native->prices[0] == 40.5);
+    auto nullable = rows;
+    nullable[0].native->prices[0] = kDdbNullPrice;
+    nullable[0].native->prices[3] = kDdbNullPrice;
+    for (auto mode : {AdjustmentMode::forward, AdjustmentMode::backward}) {
+        const auto adjusted = apply(nullable, {10, 20}, mode);
+        check(adjusted[0].native->prices[0] == kDdbNullPrice && adjusted[0].native->prices[3] == kDdbNullPrice);
+        check(adjusted[0].native->prices[1] == (mode == AdjustmentMode::forward ? 5.06 : 20.25));
+        (void)canonical_native(adjusted[0]);
+    }
     check(forward[0].volume == rows[0].volume && forward[0].native->open_oi == rows[0].native->open_oi &&
           forward[0].native->close_oi == rows[0].native->close_oi && rows[0].native->prices[0] == 10.125);
     check(apply({}, {}, AdjustmentMode::forward).empty());

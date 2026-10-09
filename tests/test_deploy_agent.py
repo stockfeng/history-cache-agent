@@ -2,6 +2,7 @@
 
 import copy
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -65,6 +66,11 @@ class FakeDocker:
             item['Config']['Labels'] = dict([label])
             selected = IMAGE if IMAGE in args else 'sha256:' + 'e' * 64
             item['Config']['Cmd'] = args[args.index(selected) + 1:]
+            for i, arg in enumerate(args):
+                if arg == '-v':
+                    mount = args[i + 1].split(':')
+                    item['Mounts'].append(dict(Type='bind', Source=mount[0], Destination=mount[1],
+                                               RW=len(mount) == 2 or mount[2] != 'ro'))
             self.containers[NEW] = item
         elif action == 'start':
             self.containers[args[1]]['State']['Running'] = True
@@ -123,6 +129,88 @@ class DeployTests(unittest.TestCase):
         create = next(c for c in self.docker.calls if c[0] == 'create')
         for flag, value in [('--memory', '128m'), ('--memory-swap', '128m'), ('--cpus', '0.25'), ('--pids-limit', '32')]:
             self.assertEqual(create[create.index(flag) + 1], value)
+
+    def policy_input(self):
+        source = self.root / 'suspensions.json'
+        value = {'schema_version': 1, 'policy': 'a-share-null-placeholder-v1', 'intervals': [
+            dict(symbol='000001.SZ', start_ms=1000, end_ms=2000, evidence='synthetic' + 'x' * 70000)]}
+        data = json.dumps(value).encode()
+        source.write_bytes(data)
+        source.chmod(0o600)
+        return source, hashlib.sha256(data).hexdigest()
+
+    def policy_probe(self, expected):
+        original = deploy.helper
+        def helper(name):
+            value = original(name)
+            if name == 'probe-agent':
+                value.suspension_policy = lambda path, actual: self.assertEqual(actual, expected)
+            return value
+        return patch.object(deploy, 'helper', side_effect=helper)
+
+    def test_policy_frozen_mounted_and_checked_during_accept(self):
+        source, sha = self.policy_input()
+        with self.policy_probe(dict(sha256=sha, intervals=1)):
+            self.assertEqual(self.app.deploy(IMAGE, 1, self.credentials, suspensions=source,
+                                             suspensions_sha256=sha), 'COMMITTED')
+            source.write_text('{}')
+            record = self.app.journal.read()
+            frozen = Path(record['release']) / 'suspensions.json'
+            self.assertEqual(record['candidate_files'][str(frozen)], sha)
+            create = next(call for call in self.docker.calls if call[0] == 'create')
+            self.assertEqual(create[create.index('--suspensions-sha256') + 1], sha)
+            frozen.chmod(0o600)
+            frozen.write_text('{}')
+            with self.assertRaises(deploy.DeployError):
+                self.instance().accept()
+            self.assertIn(OLD, self.docker.containers)
+            self.assertEqual(self.instance().rollback(), 'ROLLED_BACK')
+
+    def test_wrong_policy_pin_never_stops_old(self):
+        source, _ = self.policy_input()
+        with self.assertRaises(ValueError):
+            self.app.deploy(IMAGE, 1, self.credentials, suspensions=source, suspensions_sha256='f' * 64)
+        self.assertFalse(any(c[0] in ('stop', 'rename', 'create', 'start') for c in self.docker.calls))
+        self.assertTrue(self.docker.containers[OLD]['State']['Running'])
+
+    def test_policy_cannot_disappear_and_old_policy_survives_unknown_start(self):
+        source, sha = self.policy_input()
+        self.docker.containers[OLD]['Mounts'] = [dict(Type='bind', RW=False, Source=str(source),
+            Destination='/run/config/history-suspensions.json')]
+        with self.assertRaises(deploy.DeployError):
+            self.run_deploy()
+        self.assertEqual(self.docker.calls, [])
+        self.docker.fail_after = 'start'
+        with self.assertRaises(deploy.UnknownOutcome):
+            self.app.deploy(IMAGE, 1, self.credentials, suspensions=source, suspensions_sha256=sha)
+        self.docker.fail_after = None
+        self.assertEqual(self.instance().recover(True), 'ROLLED_BACK')
+        self.assertEqual(deploy.config_files(self.docker.inspect(deploy.NAME), self.app.socket_dir)[str(source)], sha)
+
+    def test_loaded_policy_mismatch_rolls_back(self):
+        source, sha = self.policy_input()
+        original = deploy.helper
+        def helper(name):
+            value = original(name)
+            if name == 'probe-agent':
+                def mismatch(*_):
+                    raise ValueError('policy mismatch')
+                value.suspension_policy = mismatch
+            return value
+        with patch.object(deploy, 'helper', side_effect=helper), self.assertRaises(ValueError):
+            self.app.deploy(IMAGE, 1, self.credentials, suspensions=source, suspensions_sha256=sha)
+        self.assertEqual(self.app.journal.read()['phase'], 'ROLLED_BACK')
+        self.assertTrue(self.docker.containers[OLD]['State']['Running'])
+
+    def test_only_policy_mount_has_larger_size_budget(self):
+        source, sha = self.policy_input()
+        item = container(OLD, deploy.NAME)
+        item['Mounts'] = [dict(Type='bind', RW=False, Source=str(source),
+                             Destination='/run/config/history-suspensions.json')]
+        self.assertEqual(deploy.config_files(item, self.app.socket_dir), {str(source): sha})
+        item['Mounts'][0]['Destination'] = '/run/config/other.json'
+        with self.assertRaises(deploy.DeployError):
+            deploy.config_files(item, self.app.socket_dir)
 
     def test_fingerprint_only_normalizes_explicit_false_null_oom_default(self):
         before = container(NEW, deploy.NAME)

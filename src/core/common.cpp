@@ -2,6 +2,7 @@
 
 #include "binary.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -151,6 +152,10 @@ SeriesId series_id(const SeriesIdentity& identity) {
 }
 
 void validate_row(const Row& row) {
+    if (row.native) {
+        (void)canonical_native(row);
+        return;
+    }
     detail::require(row.timestamp_ms >= 0 && std::isfinite(row.open) &&
                     std::isfinite(row.high) && std::isfinite(row.low) && std::isfinite(row.close),
                     "row has negative timestamp or nonfinite price", ErrorCode::invalid);
@@ -207,7 +212,7 @@ std::array<uint8_t, 64> canonical_native(const Row& row) {
     };
     append(static_cast<uint64_t>(row.timestamp_ms));
     for (double price : row.native->prices) {
-        detail::require(std::isfinite(price) && price != -std::numeric_limits<double>::max(),
+        detail::require(std::isfinite(price),
                         "invalid DDB native price", ErrorCode::invalid);
         append(detail::bits<uint64_t>(price));
     }
@@ -215,6 +220,38 @@ std::array<uint8_t, 64> canonical_native(const Row& row) {
     append(static_cast<uint64_t>(row.native->open_oi));
     append(static_cast<uint64_t>(row.native->close_oi));
     return result;
+}
+
+bool has_null_price(const Row& row) {
+    return row.native && std::any_of(row.native->prices.begin(), row.native->prices.end(),
+                                    [](double value) { return value == kDdbNullPrice; });
+}
+
+bool a_share_null_placeholder(const Row& row) {
+    return row.native && row.native->prices == std::array<double, 4>{kDdbNullPrice, 0, 0, kDdbNullPrice} &&
+           row.volume == 0 && row.native->open_oi == 0 && row.native->close_oi == 0;
+}
+
+void validate_suspensions(const std::vector<ConfirmedSuspension>& intervals) {
+    detail::require(intervals.size() <= 10000, "suspension interval limit", ErrorCode::resource_limit);
+    for (const auto& item : intervals) {
+        const auto& symbol = item.symbol;
+        detail::require(symbol.size() == 9 && symbol.substr(0, 6).find_first_not_of("0123456789") == std::string::npos &&
+                        (symbol.substr(6) == ".SH" || symbol.substr(6) == ".SZ"),
+                        "suspension policy requires an A-share symbol", ErrorCode::invalid);
+        validate_coverage(item.coverage);
+        detail::require(item.coverage.start_ms > 0 && item.coverage.end_ms <= 32503680000000LL - 28800000,
+                        "suspension interval outside clock range", ErrorCode::invalid);
+    }
+}
+
+bool confirmed_suspension(const Row& row, const std::string& symbol,
+                          const std::vector<ConfirmedSuspension>& intervals) {
+    if (!a_share_null_placeholder(row)) return false;
+    return std::any_of(intervals.begin(), intervals.end(), [&](const auto& item) {
+        return item.symbol == symbol && row.timestamp_ms >= item.coverage.start_ms &&
+               row.timestamp_ms < item.coverage.end_ms;
+    });
 }
 
 Bytes read_file(const std::filesystem::path& path, uint64_t max_bytes) {

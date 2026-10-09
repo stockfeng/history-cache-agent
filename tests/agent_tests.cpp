@@ -100,11 +100,12 @@ void publish(Peer& peer, const std::string& month, hc::Coverage coverage, uint64
     test::Workspace directory;
     if (!empty && rows.empty()) rows.push_back({coverage.start_ms, 10, 11, 9, 10, 100});
     if (native) for (auto& row : rows)
-        row.native = hc::Row::NativeFields{{10, 11, 9, 10}, 100, 101};
+        if (!row.native) row.native = hc::Row::NativeFields{{10, 11, 9, 10}, 100, 101};
     const auto market = symbol == "000001.SZ" ? "SZ" : symbol == "00700.HK" ? "HK" :
         symbol == "AP612C8000.CZC" ? "CZC" : "US";
     hc::CatalogEntry entry{{native ? "ddb-history-native64" : full ? "ddb-history-kline48" : "ddb-history-snapshot", market, symbol, 60, "none"},
         test::version(), seq, coverage, rows.size(), std::nullopt};
+    entry.nullable_prices = std::any_of(rows.begin(), rows.end(), hc::has_null_price);
     hc::Bytes pack;
     if (!empty) {
         const auto file = directory.root / "pack.r2b";
@@ -127,6 +128,121 @@ void publish(Peer& peer, const std::string& month, hc::Coverage coverage, uint64
     if (entry.pack) peer.objects[prefix + entry.pack->key] = pack;
     peer.objects[prefix + key] = manifest;
     peer.objects[prefix + "current.json"] = pointer;
+}
+
+Json suspension_service_tests() {
+    Json vectors = Json::array();
+    constexpr int64_t day_ms = 86400000;
+    const auto make_row = [](int64_t time, bool suspended) {
+        hc::Row row{time, 0, 0, 0, 0, 0};
+        row.native = hc::Row::NativeFields{suspended ? std::array<double, 4>{hc::kDdbNullPrice, 0, 0, hc::kDdbNullPrice}
+                                                   : std::array<double, 4>{10, 11, 9, 10}, 0, 0};
+        return row;
+    };
+    auto peer = std::make_shared<Peer>();
+    const auto end = boundary + 4 * day_ms;
+    const std::vector<hc::Row> raw{make_row(boundary, false), make_row(boundary + day_ms, true),
+        make_row(boundary + 2 * day_ms, false), make_row(boundary + 3 * day_ms, true)};
+    publish(*peer, "202610", {boundary, end}, 1, false, "000001.SZ", raw, false, true);
+    auto factors = factor_fixture();
+    factors["source_epoch"] = "ddb-factor-" + hc::hex(hc::sha256("synthetic-suspension-factors"));
+    factors["valid_until_ms"] = factors.at("observed_at_ms").get<int64_t>() + 3600000;
+    const auto factor_day = (boundary + 28800000) / day_ms;
+    factors["rows"].push_back({{"code", "000001.SZ"}, {"ex_date", factor_day + 3},
+        {"ex_factor", 2.0}, {"cum_factor", 8.0}, {"update_time", 3}});
+    publish_factors(*peer, factors);
+    auto cfg = config();
+    cfg.enable_adjustment = true;
+    cfg.confirmed_suspensions = {{"000001.SZ", {boundary + day_ms, boundary + 2 * day_ms}},
+                                {"000001.SZ", {boundary + 3 * day_ms, end}}};
+    hc::Agent agent(cfg, peer);
+    auto input = request(boundary, end);
+    input["row_encoding"] = "le-ddb-native64-v1";
+    input["allow_partial"] = true;
+    hc::Agent unconfirmed(config(), peer);
+    check(unconfirmed.handle_query(input).at("status") == "ERROR", "unconfirmed NULL silently omitted");
+    const auto visible_bytes = [&](double first_price, double second_price) {
+        hc::Bytes bytes;
+        for (auto row : {raw[0], raw[2]}) {
+            const double ratio = row.timestamp_ms == boundary ? first_price / 10 : second_price / 10;
+            for (auto& price : row.native->prices) price *= ratio;
+            const auto encoded = hc::canonical_native(row);
+            bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+        }
+        return hc::hex(bytes.data(), bytes.size());
+    };
+    const auto plain = agent.handle_query(input);
+    vectors.push_back({{"request", input}, {"response", plain}});
+    check(plain.at("status") == "HIT" && plain.at("rows") == 2 && plain.at("omitted_suspension_rows") == 2 &&
+          plain.at("data") == visible_bytes(10, 10) && plain.at("coverage_end_ms") == end,
+          "suspension visibility changed prices or coverage");
+    for (const auto* mode : {"forward", "backward"}) {
+        input["adjust"] = mode;
+        const auto adjusted = agent.handle_query(input);
+        vectors.push_back({{"request", input}, {"response", adjusted}});
+        check(adjusted.at("status") == "HIT" && adjusted.at("rows") == 2 &&
+              adjusted.at("data") == (std::string(mode) == "forward" ? visible_bytes(5, 10) : visible_bytes(20, 40)),
+              "factor on suspended date not applied");
+        if (std::string(mode) == "forward")
+            check(adjusted.at("adjustment").at("anchor_day") == (boundary + 2 * day_ms + 28800000) / day_ms,
+                  "anchor not last visible row");
+        auto composite = input;
+        composite["op"] = "adjust_rows";
+        composite["allow_partial"] = false;
+        composite["input_adjust"] = "none";
+        composite["data"] = plain.at("data");
+        composite["rows_sha256"] = plain.at("rows_sha256");
+        composite["prefix_end_ms"] = boundary + 2 * day_ms;
+        composite["prefix_rows"] = 1;
+        check(agent.handle_query(composite).at("data") == adjusted.at("data"), "composite visibility differs");
+    }
+    for (const auto* mode : {"none", "forward", "backward"}) {
+        input["adjust"] = mode;
+        input["start_ms"] = boundary + day_ms;
+        input["end_ms"] = boundary + 2 * day_ms;
+        const auto empty = agent.handle_query(input);
+        vectors.push_back({{"request", input}, {"response", empty}});
+        check(empty.at("status") == "HIT" && empty.at("rows") == 0 && empty.at("data") == "" &&
+              empty.at("coverage_end_ms") == boundary + 2 * day_ms, "confirmed empty is not a complete HIT");
+    }
+    input["adjust"] = "none";
+    input["start_ms"] = boundary;
+    input["end_ms"] = end + day_ms;
+    check(agent.handle_query(input).at("status") == "PARTIAL", "unknown tail misclassified complete");
+    input["start_ms"] = end;
+    check(agent.handle_query(input).at("status") == "MISS", "uncovered range misclassified suspension");
+
+    // More placeholders than the client page limit must not hide the next bar.
+    std::vector<hc::Row> dense;
+    for (int i = 0; i < 5002; ++i) dense.push_back(make_row(boundary + i * 1000LL, i < 5001));
+    auto dense_peer = std::make_shared<Peer>();
+    publish(*dense_peer, "202610", {boundary, boundary + 6000000}, 1, false, "000001.SZ", dense, false, true);
+    cfg.confirmed_suspensions = {{"000001.SZ", {boundary, boundary + 6000000}}};
+    hc::Agent dense_agent(cfg, dense_peer);
+    input = request(boundary, boundary + 6000000);
+    input["row_encoding"] = "le-ddb-native64-v1";
+    input["max_rows"] = 1;
+    const auto page = dense_agent.handle_query(input);
+    vectors.push_back({{"request", input}, {"response", page}});
+    check(page.at("status") == "HIT" && page.at("rows") == 1 && page.at("omitted_suspension_rows") == 5001 &&
+          page.at("first_ms") == boundary + 5001000, "placeholder consumed visible page limit");
+    for (int mutation = 0; mutation < 3; ++mutation) {
+        auto bad = make_row(boundary, true);
+        if (mutation == 0) bad.volume = 1;
+        if (mutation == 1) bad.native->prices[1] = 1;
+        if (mutation == 2) bad.native->close_oi = 1;
+        auto bad_peer = std::make_shared<Peer>();
+        publish(*bad_peer, "202610", {boundary, boundary + 6000000}, 1, false, "000001.SZ", {bad}, false, true);
+        hc::Agent bad_agent(cfg, bad_peer);
+        check(bad_agent.handle_query(input).at("status") == "ERROR", "unexpected NULL shape silently omitted");
+    }
+    auto hk_peer = std::make_shared<Peer>();
+    publish(*hk_peer, "202610", {boundary, boundary + 6000000}, 1, false, "00700.HK", {make_row(boundary, false)}, false, true);
+    hc::Agent hk_agent(cfg, hk_peer);
+    input["symbol"] = "00700.HK";
+    check(hk_agent.handle_query(input).at("rows") == 1, "HK zero-volume price omitted");
+    std::cout << "PASS suspension NULL visibility paging empty partial factors composite HK_zero_volume\n";
+    return vectors;
 }
 
 void adjustment_service_tests() {
@@ -970,7 +1086,7 @@ Json complete_tests() {
 
 int main(int argc, char** argv) {
     try {
-        if (argc == 7 && std::string(argv[1]) == "candidate") {
+        if ((argc == 7 || argc == 8) && std::string(argv[1]) == "candidate") {
             const std::filesystem::path directory(argv[2]);
             const auto manifest_bytes = hc::read_file(directory / "candidate.json", 1024 * 1024);
             const auto manifest = hc::parse_manifest({manifest_bytes.begin(), manifest_bytes.end()});
@@ -984,7 +1100,16 @@ int main(int argc, char** argv) {
                 peer->objects[prefix + entry.pack->key] = hc::read_file(
                     directory / std::filesystem::path(entry.pack->key).filename(), hc::kMaxObjectBytes);
             const auto input = hc::read_file(argv[4], 4096);
-            hc::Agent agent(config(), peer);
+            auto candidate_config = config();
+            if (argc == 8) {
+                const auto policy = Json::parse(hc::read_file(argv[7], hc::kMaxMetadataBytes));
+                check(policy.at("policy") == "a-share-null-placeholder-v1" && policy.at("schema_version") == 1,
+                      "invalid fixture policy");
+                for (const auto& item : policy.at("intervals"))
+                    candidate_config.confirmed_suspensions.push_back({item.at("symbol"),
+                        {item.at("start_ms"), item.at("end_ms")}});
+            }
+            hc::Agent agent(candidate_config, peer);
             const auto request_json = Json::parse(input);
             const auto cold = agent.handle_query(request_json);
             const auto expected = hc::read_file(argv[5], 5000 * 64);
@@ -996,7 +1121,7 @@ int main(int argc, char** argv) {
                 return entry.row_count <= 5000 && (!entry.pack || entry.pack->bytes <= config().full_pack_read_bytes);
             });
             if (cacheable) check(warm.at("metrics").at("http").empty(), "cacheable candidate issued warm HTTP");
-            auto range_config = config(); range_config.full_pack_read_bytes = 0;
+            auto range_config = candidate_config; range_config.full_pack_read_bytes = 0;
             hc::Agent range_agent(range_config, peer);
             check(range_agent.handle_query(request_json).at("data") == cold.at("data"), "native Range path differs");
             hc::write_new_file(argv[6], Json::array({{{"request", request_json}, {"response", cold}}}).dump());
@@ -1012,8 +1137,10 @@ int main(int argc, char** argv) {
             maintenance_tests();
             demand_tests();
             adjustment_service_tests();
+            const auto suspensions = suspension_service_tests();
             versioned_factor_tests();
             auto vectors = market_tests();
+            for (const auto& vector : suspensions) vectors.push_back(vector);
             for (const auto& vector : intraday) vectors.push_back(vector);
             const auto complete = complete_tests();
             for (const auto& vector : complete) vectors.push_back(vector);
