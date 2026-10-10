@@ -16,6 +16,10 @@
 #include <optional>
 #include <regex>
 #include <set>
+#include <sstream>
+#ifdef HC_HAS_CURL
+#include <curl/curl.h>
+#endif
 
 namespace hc = history_cache;
 namespace fs = std::filesystem;
@@ -259,16 +263,10 @@ hc::Manifest daily_source_manifest(const Json& source) {
             "unsupported market identity");
     const auto dot = entry.identity.symbol.rfind('.');
     if (entry.identity.market == "US") {
-        require(dot == std::string::npos &&
-                std::all_of(entry.identity.symbol.begin(), entry.identity.symbol.end(),
-                            [](char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                                        (c >= '0' && c <= '9'); }),
-                "US symbol must be bare alphanumeric");
+        static const std::regex us_symbol("[A-Za-z][A-Za-z0-9.\\-]{0,15}");
+        require(std::regex_match(entry.identity.symbol, us_symbol), "invalid US symbol");
     } else {
-        static const std::regex apple_option("AP[0-9]{3}[CP][0-9]{1,8}\\.CZC");
-        const bool option = entry.identity.market == "CZC" &&
-                            std::regex_match(entry.identity.symbol, apple_option);
-        require(dot != std::string::npos && dot >= 4 && (dot <= 8 || option) &&
+        require(dot != std::string::npos &&
                 entry.identity.symbol.substr(dot + 1) == entry.identity.market,
                 "symbol must end with .market");
         const auto prefix = entry.identity.symbol.substr(0, dot);
@@ -280,11 +278,8 @@ hc::Manifest daily_source_manifest(const Json& source) {
                             [](char c) { return c >= '0' && c <= '9'; }),
                 "stock symbol prefix must be digits");
         } else {
-            require(std::all_of(prefix.begin(), prefix.end(),
-                                [](char c) { return (c >= '0' && c <= '9') ||
-                                             (c >= 'a' && c <= 'z') ||
-                                             (c >= 'A' && c <= 'Z'); }),
-                    "futures symbol prefix must be alphanumeric");
+            static const std::regex derivative("[A-Za-z]{1,3}[0-9]{3,4}((C|P|-C-|-P-)[0-9]{1,8})?");
+            require(std::regex_match(prefix, derivative), "invalid derivative symbol prefix");
         }
     }
     entry.data_version = data_version;
@@ -298,11 +293,13 @@ hc::Manifest daily_source_manifest(const Json& source) {
     require(limit > 0 && entry.row_count <= limit && source.at("query_row_limit") == limit + 1 &&
             source.at("max_partitions") == 1, "incomplete or oversized source query");
     const auto time_column = mapping_source.at("time_column").get<std::string>();
+    const auto symbol_literal = entry.identity.symbol.find('-') == std::string::npos
+        ? "`" + entry.identity.symbol : "\"" + entry.identity.symbol + "\"";
     const auto query = "select top " + std::to_string(limit + 1) + " long(" + time_column +
         ") as ddb_timestamp_ms, open, high, low, close, volume" +
         (native ? ", open_oi, close_oi" : complete ? ", amount as turnover, open_oi as open_interest" : "") + " from loadTable(\"" + database +
         "\", \"" + mapping_source.at("table").get<std::string>() + "\") where " +
-        mapping_source.at("code_column").get<std::string>() + "=`" + entry.identity.symbol +
+        mapping_source.at("code_column").get<std::string>() + "=" + symbol_literal +
         " and duration=60 and " + time_column + ">=timestamp(" +
         std::to_string(entry.coverage.start_ms + mapping_source.at("timestamp_offset_ms").get<int64_t>()) +
         ") and " + time_column + "<timestamp(" +
@@ -516,16 +513,8 @@ Candidate load_candidate(const fs::path& directory) {
     return candidate;
 }
 
-void compact(const Arguments& args) {
-    const auto input = load_candidate(args.get("--candidate"));
-    require(input.sources.size() <= 31 && !input.sources.empty(), "invalid month entry count");
-    Json sources = Json::array();
-    hc::Bytes bytes;
-    for (size_t i = 0; i < input.sources.size(); ++i) {
-        require(!compact_proof(input.sources[i]), "candidate is already compacted");
-        sources.push_back(input.sources[i]);
-        for (const auto& row : decode_entry_rows(input, i)) append_row(bytes, row, input.manifest.entries[i].identity);
-    }
+void compact_rows(const Json& sources, const hc::Bytes& bytes, const fs::path& output) {
+    require(sources.is_array() && !sources.empty() && sources.size() <= 31, "invalid month entry count");
     const auto& first = sources.front();
     Json proof{{"schema_version", 1}, {"kind", "ddb-monthly-compaction"},
         {"contract", "ddb-native64-daily-proof-bundle-v1"}, {"sources", sources},
@@ -540,7 +529,6 @@ void compact(const Arguments& args) {
     verify_source_rows(proof, bytes);
     auto& entry = manifest.entries.front();
     const auto rows = parse_rows(bytes, entry);
-    const fs::path output(args.get("--output"));
     hc::create_new_directory(output);
     if (!rows.empty()) {
         const auto path = output / "snapshot.r2b";
@@ -557,6 +545,27 @@ void compact(const Arguments& args) {
     std::cout << canonical({{"status", "PASS_MONTH_COMPACTION"}, {"days", sources.size()},
         {"rows", rows.size()}, {"data_objects", rows.empty() ? 0 : 1}, {"proof_objects", 1},
         {"rows_sha256", proof.at("rows_sha256")}, {"ddb_queries", 0}, {"r2_requests", 0}});
+}
+
+void compact(const Arguments& args) {
+    const auto input = load_candidate(args.get("--candidate"));
+    require(input.sources.size() <= 31 && !input.sources.empty(), "invalid month entry count");
+    Json sources = Json::array();
+    hc::Bytes bytes;
+    for (size_t i = 0; i < input.sources.size(); ++i) {
+        require(!compact_proof(input.sources[i]), "candidate is already compacted");
+        sources.push_back(input.sources[i]);
+        for (const auto& row : decode_entry_rows(input, i)) append_row(bytes, row, input.manifest.entries[i].identity);
+    }
+    compact_rows(sources, bytes, args.get("--output"));
+}
+
+void encode_month(const Arguments& args) {
+    const auto sources = read_json(args.get("--sources"));
+    const auto bytes = hc::read_file(args.get("--rows"), kMonthRows * 64);
+    // Same per-day guards, row digests and canonical pack as compact(); no daily
+    // intermediate packs or relaxed durability on the retained monthly output.
+    compact_rows(sources, bytes, args.get("--output"));
 }
 
 hc::Pointer epoch_replacement(const Candidate& before, const Candidate& after, uint64_t seq) {
@@ -741,10 +750,12 @@ void local(const Arguments& args) {
 }
 
 // Probe the staging namespace and print its current pointer without writing.
-bool current(const Arguments& args, const hc::S3Config& config) {
+bool current(const Arguments& args, const hc::S3Config& config,
+             std::shared_ptr<hc::HttpTransport> shared = {}) {
 #ifndef HC_HAS_CURL
     (void)args;
     (void)config;
+    (void)shared;
     throw hc::Error(hc::ErrorCode::invalid, "snapshot network commands require a curl-enabled build");
 #else
     require(args.get("--retain") == "yes", "explicit retained staging scope required");
@@ -754,7 +765,7 @@ bool current(const Arguments& args, const hc::S3Config& config) {
     const char* secret = std::getenv(config.environment == "production" ? "R2_PRODUCTION_SECRET_ACCESS_KEY" : "R2_STAGING_SECRET_ACCESS_KEY");
     require(id && *id && secret && *secret, "authorized R2 credentials are unavailable");
     auto transport = std::make_shared<hc::sample::SnapshotDiagnostics>(
-        std::make_shared<hc::CurlHttpTransport>(true, hc::CurlHttpTransport::Reuse::publication));
+        shared ? shared : std::make_shared<hc::CurlHttpTransport>(true, hc::CurlHttpTransport::Reuse::publication));
     auto credentials = std::make_shared<hc::S3Credentials>(id, secret);
     hc::S3Store store(config, transport, credentials, limits());
     Json result{{"status", "PASS_DDB_SNAPSHOT_STAGING_CURRENT"}, {"bucket", config.bucket},
@@ -792,7 +803,7 @@ bool current(const Arguments& args, const hc::S3Config& config) {
 #endif
 }
 
-bool network(const Arguments& args, bool publish) {
+bool network(const Arguments& args, bool publish, std::shared_ptr<hc::HttpTransport> shared = {}) {
     const auto reuse = args.optional("--reuse-verified-objects", "no");
     require(reuse == "no" || (publish && reuse == "yes"), "invalid publication read reuse option");
     const auto candidate = load_candidate(args.get("--candidate"));
@@ -804,6 +815,7 @@ bool network(const Arguments& args, bool publish) {
 #ifndef HC_HAS_CURL
     (void)publish;
     (void)plan;
+    (void)shared;
     throw hc::Error(hc::ErrorCode::invalid, "snapshot network commands require a curl-enabled build");
 #else
     require(args.get("--retain") == "yes", "explicit retained staging scope required");
@@ -818,7 +830,7 @@ bool network(const Arguments& args, bool publish) {
     require(id && *id && secret && *secret, "authorized R2 credentials are unavailable");
     auto credentials = std::make_shared<hc::S3Credentials>(id, secret);
     auto transport = std::make_shared<hc::sample::SnapshotDiagnostics>(
-        std::make_shared<hc::CurlHttpTransport>(true, hc::CurlHttpTransport::Reuse::publication));
+        shared ? shared : std::make_shared<hc::CurlHttpTransport>(true, hc::CurlHttpTransport::Reuse::publication));
     hc::S3Store store(config, transport, credentials, limits(&candidate));
     hc::sample::VerifiedObjectStore verified(store, 16 * kBytes);
     hc::ObjectStore& publication = reuse == "yes" ? static_cast<hc::ObjectStore&>(verified) : store;
@@ -892,10 +904,73 @@ bool network(const Arguments& args, bool publish) {
 #endif
 }
 
+// One bounded pipe worker owns its connections, never cached pointers or journals.
+int pipe_worker(const Arguments& options) {
+    const auto maximum = number(options.get("--max-commands"), 4096);
+    require(maximum > 0, "positive worker command bound required");
+    const auto mode = options.get("--mode");
+    require(mode == "encoder" || mode == "publisher", "invalid worker mode");
+    auto transport = std::make_shared<hc::CurlHttpTransport>(true, hc::CurlHttpTransport::Reuse::publication);
+    std::string bound_scope;
+    std::cout << canonical({{"status", "SNAPSHOT_WORKER_READY"}, {"mode", mode}}) << std::flush;
+    for (uint64_t count = 0; count < maximum; ++count) {
+        std::string line;
+        char ch;
+        while (std::cin.get(ch) && ch != '\n') {
+            require(line.size() < 16384, "worker command exceeds byte limit");
+            line.push_back(ch);
+        }
+        if (line.empty() && !std::cin) return 0;
+        std::ostringstream output;
+        auto* previous = std::cout.rdbuf(output.rdbuf());
+        bool success = false;
+        try {
+            const auto request = Json::parse(line);
+            require(request.is_array() && request.size() >= 1 && request.size() <= 40, "invalid worker request");
+            std::vector<std::string> words{"history-cache-snapshot"};
+            for (const auto& item : request) {
+                require(item.is_string(), "worker arguments must be strings");
+                words.push_back(item.get<std::string>());
+                require(words.back().find('\0') == std::string::npos, "NUL worker argument");
+            }
+            std::vector<char*> argv;
+            for (auto& word : words) argv.push_back(word.data());
+            const int argc = static_cast<int>(argv.size());
+            const auto& command = words[1];
+            if (mode == "encoder") {
+                require(command == "encode-month", "encoder worker only accepts encode-month");
+                encode_month(Arguments(argc, argv.data(), {"--sources", "--rows", "--output"}));
+                success = true;
+            } else {
+                require(command == "current" || command == "publish", "publisher worker command not allowed");
+                const Arguments args(argc, argv.data(), {"--candidate", "--account", "--bucket", "--run-id",
+                    "--retain", "--output", "--expected-seq", "--resume-journal", "--storage-config",
+                    "--reuse-verified-objects", "--epoch-base"});
+                const auto config = config_from(args);
+                const auto scope = config.account_id + "/" + config.bucket + "/" + config.environment + "/" + config.jurisdiction;
+                require(bound_scope.empty() || bound_scope == scope, "worker storage scope changed");
+                bound_scope = scope;
+                success = command == "current" ? current(args, config, transport) : network(args, true, transport);
+            }
+            std::cout.rdbuf(previous);
+            const auto result = Json::parse(output.str());
+            std::cout << canonical({{"ok", success}, {"result", result}}) << std::flush;
+        } catch (const std::exception&) {
+            std::cout.rdbuf(previous);
+            // Detailed network failures remain in the per-command report, not in credentials or arguments.
+            std::cout << canonical({{"ok", false}, {"result", {{"status", "ERROR_SNAPSHOT_WORKER"}}}}) << std::flush;
+        }
+    }
+    return 0;
+}
+
 void usage() {
     std::cout << "history-cache-snapshot: bounded native-version DDB snapshots, staging by default\n"
+              << "  capabilities (offline build/runtime check; no network requests)\n"
+              << "  worker --mode encoder|publisher --max-commands N (bounded JSON-lines stdin/stdout)\n"
               << "  explicit production scope: --storage-config PROFILE on current/plan/publish/read\n"
               << "  encode --source SOURCE_JSON --rows ROWS_BIN --output NEW_DIRECTORY\n"
+              << "  encode-month --sources DAILY_PROOFS_JSON --rows NATIVE_ROWS_BIN --output NEW_DIRECTORY\n"
               << "  local --candidate DIR --output NEW_DIRECTORY [--start MS --end MS --max-count N]\n"
               << "  compact --candidate DAILY_MONTH_DIR --output NEW_DIRECTORY\n"
               << "  current --account ID --bucket STAGING --run-id ID --retain yes --output NEW_DIRECTORY\n"
@@ -913,8 +988,22 @@ int main(int argc, char** argv) {
     try {
         if (argc < 2 || std::string(argv[1]) == "--help") { usage(); return argc < 2 ? 2 : 0; }
         const std::string command = argv[1];
-        if (command == "encode") {
+        if (command == "capabilities") {
+            require(argc == 2, "capabilities takes no arguments");
+            bool ready = false;
+#ifdef HC_HAS_CURL
+            const auto* info = curl_version_info(CURLVERSION_NOW);
+            ready = info && info->version_num == LIBCURL_VERSION_NUM &&
+                    (info->features & CURL_VERSION_SSL) && (info->features & CURL_VERSION_ASYNCHDNS);
+#endif
+            std::cout << canonical({{"status", "SNAPSHOT_CAPABILITIES"}, {"https_runtime_ready", ready},
+                                    {"network_requests", 0}});
+        } else if (command == "worker") {
+            return pipe_worker(Arguments(argc, argv, {"--mode", "--max-commands"}));
+        } else if (command == "encode") {
             encode(Arguments(argc, argv, {"--source", "--rows", "--output"}));
+        } else if (command == "encode-month") {
+            encode_month(Arguments(argc, argv, {"--sources", "--rows", "--output"}));
         } else if (command == "local") {
             local(Arguments(argc, argv, {"--candidate", "--output", "--start", "--end", "--max-count"}));
         } else if (command == "compact") {

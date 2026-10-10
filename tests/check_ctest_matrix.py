@@ -43,6 +43,8 @@ def main():
     assert "PASS snapshot_cli roundtrip=5 negative_checks=14 network=0" in by_name["snapshot_cli"], "missing snapshot CLI checks"
     assert "PASS snapshot_complete roundtrip=5 fields8 namespace_isolation network=0" in by_name["snapshot_cli"], "missing complete snapshot checks"
     assert "PASS snapshot_native roundtrip=5 double_ohlc two_oi namespace_isolation network=0" in by_name["snapshot_cli"], "missing native snapshot checks"
+    assert "PASS snapshot_worker direct_compact_parity empty_days bounds recovery proof_guards network=0" in by_name["snapshot_cli"], "missing bounded worker checks"
+    assert "PASS snapshot_symbols dotted_us hyphenated_us derivatives query_literals network=0" in by_name["snapshot_cli"], "missing symbol checks"
     for name in ("agent_service", "agent_lifetime", "agent_uds"):
         assert any(line.startswith("PASS " + name + " ") for line in by_name[name]), "missing agent checks"
     assert "PASS agent_market UTC regular390 extended960 max_rows empty month DST hash" in by_name["agent_service"], "missing UTC market checks"

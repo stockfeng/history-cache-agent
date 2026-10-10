@@ -4,6 +4,28 @@ C++17 core and UDS agent for the R2 historical-cache project. This is an
 independent Git repository inside the integration workspace. Building or testing
 the component does not deploy services or publish data.
 
+## Bounded snapshot upload workers, 2026-10-10
+
+`history-cache-snapshot encode-month --sources DAILY_PROOFS_JSON --rows ROWS_BIN
+--output NEW_DIRECTORY` builds the same native64 monthly candidate as daily
+`encode` followed by `compact`, without daily intermediate packs. Contiguous
+physical-day coverage, one source guard/version and every daily row hash remain
+mandatory. Empty days and the existing NULL encoding retain their semantics.
+
+`worker --mode encoder|publisher --max-commands N` accepts JSON arrays of CLI
+arguments, one per line (16 KiB maximum), and exits after at most N commands
+(1-4096). It first emits `SNAPSHOT_WORKER_READY`, then one `ok`/`result` reply
+per command. Encoder mode only accepts `encode-month`; publisher mode accepts
+`current`/`publish`, binds one storage scope and reuses its HTTPS connections
+across commands. Pointers and journals are never cached across commands; there
+is no automatic replay on failure. Each publication still enforces its existing
+credentials, explicit scope, CAS, journal and transfer budgets.
+
+`capabilities` reports HTTPS build/runtime readiness without network access.
+US dotted/hyphenated symbols and standard futures/option symbols are supported;
+hyphenated DDB symbols use a validated string literal in the query proof.
+These are local DDB-to-R2 uploader facilities, not extra cloud Agent workers.
+
 ## NULL compatibility, 2026-10-09 (local development)
 
 NULL compatibility is implemented locally for native64 packs: nullable entries
