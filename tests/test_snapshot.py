@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import datetime as dt
 import hashlib
 import json
 import math
@@ -166,6 +167,118 @@ def invoke(tool, *args, expected=0):
     return json.loads(result.stdout or result.stderr)
 
 
+def daily_fixture(count, day=0, symbol="000001.SZ", market="SZ"):
+    source, rows = fixture(count, native=True)
+    offset = source["source"]["timestamp_offset_ms"]
+    start = source["requested_start_ms"] + day * 86400000
+    end = start + 86400000
+    source.update(requested_start_ms=start, requested_end_ms=end)
+    for key, value in (("start_date", start), ("end_date", end)):
+        source[key] = dt.datetime.fromtimestamp((value + offset) / 1000, dt.timezone.utc).date().isoformat()
+    source["identity"].update(symbol=symbol, market=market)
+    rows = b"".join(struct.pack("<q4d3q", timestamp + day * 86400000, *values)
+                    for timestamp, *values in struct.iter_unpack("<q4d3q", rows))
+    raw = b"".join(struct.pack("<q4d3q", timestamp + offset, *values)
+                   for timestamp, *values in struct.iter_unpack("<q4d3q", rows))
+    literal = '"' + symbol + '"' if '-' in symbol else '`' + symbol
+    query = (f'select top 5001 long(trade_time) as ddb_timestamp_ms, open, high, low, close, volume, open_oi, close_oi '
+             f'from loadTable("dfs://history", "stock") where code={literal} and duration=60 '
+             f'and trade_time>=timestamp({start + offset}) and trade_time<timestamp({end + offset}) '
+             'order by ddb_timestamp_ms asc, open asc, high asc, low asc, close asc, volume asc, open_oi asc, close_oi asc')
+    source["source"]["query_sha256"] = sha(query.encode())
+    source.update(rows_sha256=sha(rows), raw_rows_sha256=sha(raw))
+    return source, rows
+
+
+def exercise_worker(tool, root):
+    capabilities = invoke(tool, "capabilities")
+    check(capabilities["status"] == "SNAPSHOT_CAPABILITIES" and
+          isinstance(capabilities["https_runtime_ready"], bool) and capabilities["network_requests"] == 0,
+          "offline capabilities differ")
+    invoke(tool, "capabilities", "unexpected", expected=2)
+    daily = root / "daily"
+    daily.mkdir()
+    proofs, entries, payloads = [], [], []
+    manifest = None
+    for index, count in enumerate((2, 0, 2)):
+        source, rows = daily_fixture(count, index)
+        proof_path, rows_path = root / f"day-{index}.json", root / f"day-{index}.bin"
+        proof_path.write_bytes(canonical(source))
+        rows_path.write_bytes(rows)
+        encoded = root / f"day-{index}"
+        invoke(tool, "encode", "--source", proof_path, "--rows", rows_path, "--output", encoded)
+        manifest = json.loads(read(encoded / "candidate.json"))
+        entries.extend(manifest["entries"])
+        (daily / (sha(read(encoded / "source.json")) + ".json")).write_bytes(read(encoded / "source.json"))
+        for path in encoded.glob("*.r2b"):
+            (daily / path.name).write_bytes(read(path))
+        proofs.append(source)
+        payloads.append(rows)
+    manifest["entries"] = entries
+    (daily / "candidate.json").write_bytes(canonical(manifest))
+    reference = root / "compact"
+    invoke(tool, "compact", "--candidate", daily, "--output", reference)
+    sources, rows = root / "sources.json", root / "rows.bin"
+    sources.write_bytes(canonical(proofs))
+    rows.write_bytes(b"".join(payloads))
+
+    def command(output):
+        return ["encode-month", "--sources", str(sources), "--rows", str(rows), "--output", str(output)]
+
+    direct = root / "direct"
+    invoke(tool, *command(direct))
+    requests = [[], ["publish"], ["encode-month", "--output", "bad\0path"],
+                command(root / "worker-1"), command(root / "worker-2"), command(root / "beyond-bound")]
+    result = subprocess.run([str(tool), "worker", "--mode", "encoder", "--max-commands", "5"],
+                            input="".join(json.dumps(item) + "\n" for item in requests),
+                            text=True, capture_output=True, timeout=15)
+    check(result.returncode == 0, "worker failed")
+    replies = [json.loads(line) for line in result.stdout.splitlines()]
+    check(len(replies) == 6 and replies[0] == {"status": "SNAPSHOT_WORKER_READY", "mode": "encoder"},
+          "worker readiness or command limit differs")
+    check([reply["ok"] for reply in replies[1:]] == [False, False, False, True, True],
+          "worker failed to recover from invalid commands")
+    check(not (root / "beyond-bound").exists(), "worker exceeded command bound")
+    expected = {p.name: p.read_bytes() for p in reference.iterdir()}
+    for candidate in (direct, root / "worker-1", root / "worker-2"):
+        check({p.name: p.read_bytes() for p in candidate.iterdir()} == expected,
+              "direct/worker candidate differs from daily compaction")
+    for mode, maximum in (("encoder", "0"), ("encoder", "4097"), ("invalid", "1")):
+        invoke(tool, "worker", "--mode", mode, "--max-commands", maximum, expected=2)
+    oversized = subprocess.run([str(tool), "worker", "--mode", "encoder", "--max-commands", "1"],
+                               input="x" * 16385 + "\n", text=True, capture_output=True, timeout=5)
+    check(oversized.returncode == 2, "oversized worker command accepted")
+    for index, change in enumerate(("digest", "order", "gap", "version")):
+        invalid = copy.deepcopy(proofs)
+        if change == "digest":
+            invalid[0]["rows_sha256"] = "0" * 64
+        elif change == "order":
+            invalid.reverse()
+        elif change == "gap":
+            invalid.pop(1)
+        else:
+            invalid[1]["source_version"] += 1
+        sources.write_bytes(canonical(invalid))
+        output = root / f"invalid-month-{index}"
+        invoke(tool, *command(output), expected=2)
+        check(not output.exists(), "invalid month created a candidate")
+    print("PASS snapshot_worker direct_compact_parity empty_days bounds recovery proof_guards network=0")
+
+
+def exercise_symbols(tool, root):
+    cases = [("US", "BRK.B", True), ("US", "BRK-B", True), ("DCE", "m2701-C-3000.DCE", True),
+             ("CZC", "AP701C8000.CZC", True), ("SHF", "ag2702.SHF", True),
+             ("US", 'A\"B', False), ("US", "1BAD", False), ("DCE", "m2701-C-.DCE", False)]
+    for index, (market, symbol, valid) in enumerate(cases):
+        source, rows = daily_fixture(1, symbol=symbol, market=market)
+        proof_path, rows_path = root / "symbol.json", root / "symbol.bin"
+        proof_path.write_bytes(canonical(source))
+        rows_path.write_bytes(rows)
+        invoke(tool, "encode", "--source", proof_path, "--rows", rows_path,
+               "--output", root / f"symbol-{index}", expected=0 if valid else 2)
+    print("PASS snapshot_symbols dotted_us hyphenated_us derivatives query_literals network=0")
+
+
 def exercise(tool, root, count, complete=False, native=False):
     source, rows = fixture(count, complete, native)
     directory = root / f"rows-{count}-{'native' if native else 'full' if complete else 'legacy'}"
@@ -213,6 +326,8 @@ def main():
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="history-cache-snapshot-") as temporary:
         root = Path(temporary)
+        exercise_worker(args.tool, root)
+        exercise_symbols(args.tool, root)
         for count in (0, 1, 240, 2050, 5000):
             exercise(args.tool, root, count, native=True)
             exercise(args.tool, root, count, complete=True)
